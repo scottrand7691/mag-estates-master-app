@@ -1,0 +1,7 @@
+.resident-photo { display: inline-block; }
+.resident-photo__wrap { position: relative; display: inline-block; }
+.resident-photo__img { width: 64px; height: 64px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border); }
+.resident-photo__remove { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 50%; background: #dc3545; color: white; border: none; cursor: pointer; font-size: 14px; line-height: 1; }
+.resident-photo__change { display: block; margin-top: 4px; font-size: 12px; background: none; border: none; color: var(--accent); cursor: pointer; text-decoration: underline; }
+.resident-photo__placeholder { width: 64px; height: 64px; border-radius: 50%; border: 2px dashed var(--border); background: var(--surface); color: var(--text-secondary); cursor: pointer; font-size: 12px; }
+[data-theme="dark"] .resident-photo__placeholder { background: var(--surface-dark); }

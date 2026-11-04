@@ -1,0 +1,5 @@
+.owe-mow-reminder { display: inline-flex; gap: 6px; }
+.remind-btn { padding: 4px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.text-btn { background: #25d366; color: white; }
+.email-btn { background: #007bff; color: white; }
+.remind-btn:hover { opacity: 0.85; }

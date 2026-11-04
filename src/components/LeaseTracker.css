@@ -1,0 +1,15 @@
+.lease-tracker { padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.lease-form { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.lease-form label { display: flex; flex-direction: column; font-size: 13px; color: var(--text-secondary); }
+.lease-form input { padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--input-bg); color: var(--text); }
+.lease-form button { padding: 8px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; }
+.lease-status { padding: 8px; border-radius: 4px; font-weight: 600; text-align: center; }
+.lease-status--green { background: #d4edda; color: #155724; }
+.lease-status--orange { background: #fff3cd; color: #856404; }
+.lease-status--red { background: #f8d7da; color: #721c24; }
+.lease-warning { margin-top: 8px; padding: 8px; background: #fff3cd; color: #856404; border-radius: 4px; font-size: 13px; }
+[data-theme="dark"] .lease-status--green { background: #1e3a2f; color: #a8d5b5; }
+[data-theme="dark"] .lease-status--orange { background: #3a2f1e; color: #e0c97a; }
+[data-theme="dark"] .lease-status--red { background: #3a1e1e; color: #e0a0a0; }
+[data-theme="dark"] .lease-warning { background: #3a2f1e; color: #e0c97a; }
+@media print { .lease-form button { display: none; } }

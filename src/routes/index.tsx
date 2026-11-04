@@ -1,0 +1,6645 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type FormEvent } from "react";
+import { PlatMap, SHEET_COPY, type SheetId } from "@/components/plat-maps";
+import { AuditLog, logAudit, setAuditUser } from "@/components/wednesday/audit";
+import { HandymanBoard } from "@/components/wednesday/handyman";
+import { LowesShop } from "@/components/wednesday/lowes";
+import { HomeBoard } from "@/components/wednesday/home";
+import { Inventory } from "@/components/wednesday/inventory";
+import { TreatmentPlant } from "@/components/wednesday/treatment-plant";
+import { VendorDirectory, VendorPortal, vendorList, vendorTodoItems } from "@/components/wednesday/vendors";
+import { buildTodo, dayStamp, depositReminder, displayName, isRenterLot, LOTS, matches, matchesFilter, moveOutLot, parseDay, petFee, rentGap, rentTotal, sheetOf, withEmptyMow, type Guest, type Lot, type LotFilter, type LotStatus, type MaintJob, type Stay } from "@/data/lots";
+import { listVersions, readMaster, restoreVersion, saveBills, saveBoard, saveMowings, writeMaster } from "@/data/master.functions";
+import { addBusinessAttachment, deleteBusinessAttachment, deleteBusinessTask, listBusinessAttachments, listBusinessHistory, listBusinessTasks, readBusinessAttachment, saveBusinessTask, type BusinessAttachment, type BusinessHistoryEntry, type BusinessTask } from "@/data/business.functions";
+
+export const Route = createFileRoute("/")({ component: Home });
+
+const STORAGE_KEY = "magnolia-lot-edits";
+const SESSION_KEY = "magnolia-session";
+const REMEMBER_KEY = "magnolia-login-remember";
+const LANDLORD_KEY = "magnolia-landlord-pass";
+const HOA_KEY = "magnolia-hoa-todos";
+const RESET_KEY = "magnolia-password-resets";
+
+type ResetAsk = { id: string; at: string; address: string; lotId: string; name: string };
+
+function loadResets(): ResetAsk[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(RESET_KEY) ?? "[]") as ResetAsk[];
+    return Array.isArray(raw) ? raw.filter((item) => item && typeof item.address === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveResets(rows: ResetAsk[]) {
+  try {
+    localStorage.setItem(RESET_KEY, JSON.stringify(rows));
+  } catch {
+    /* the request still shows until refresh */
+  }
+  window.dispatchEvent(new Event("magnolia-resets"));
+}
+
+const LANDLORD_USERS = ["Clint", "Colt", "Greg", "Jane", "Amanda"] as const;
+const MANAGER_USERS = ["Belkis"] as const;
+
+type Session = { role: "landlord"; user: (typeof LANDLORD_USERS)[number] } | { role: "resident"; lotId: string } | { role: "vendor"; vendorId: string } | { role: "maintenance" } | { role: "manager"; user: (typeof MANAGER_USERS)[number] };
+type HoaItem = { id: string; text: string; done: boolean };
+
+function loadSession(): Session | null {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null") as Session | null;
+    if (raw?.role === "landlord" && LANDLORD_USERS.includes(raw.user)) return { role: "landlord", user: raw.user };
+    if (raw?.role === "resident" && raw.lotId) return raw;
+    if (raw?.role === "vendor" && raw.vendorId) return raw;
+    if (raw?.role === "maintenance") return { role: "maintenance" };
+    if (raw?.role === "manager") return { role: "manager", user: "Belkis" };
+  } catch {
+    /* show the login */
+  }
+  return null;
+}
+
+function saveSession(next: Session | null) {
+  try {
+    if (next) localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+    else localStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* this browser still stays signed in until refresh */
+  }
+}
+
+type LoginMode = "landlord" | "resident" | "maintenance" | "vendor" | "manager";
+type RememberedLogin = { mode: LoginMode; landlordName: string; address: string; username: string; password: string };
+
+function loadRemembered(): RememberedLogin | null {
+  try {
+    const raw = JSON.parse(localStorage.getItem(REMEMBER_KEY) ?? "null") as RememberedLogin | null;
+    if (!raw || (raw.mode !== "landlord" && raw.mode !== "resident" && raw.mode !== "maintenance" && raw.mode !== "vendor" && raw.mode !== "manager")) return null;
+    return { mode: raw.mode, landlordName: raw.landlordName ?? "", address: raw.address ?? "", username: raw.username ?? "", password: raw.password ?? "" };
+  } catch {
+    return null;
+  }
+}
+
+function saveRemembered(next: RememberedLogin) {
+  try { localStorage.setItem(REMEMBER_KEY, JSON.stringify(next)); } catch { /* the sign-in still goes through */ }
+}
+
+function maintenancePassword() {
+  try {
+    return localStorage.getItem("magnolia-maint-pass") || "maintenance";
+  } catch {
+    return "maintenance";
+  }
+}
+
+function landlordPassword() {
+  try {
+    return localStorage.getItem(LANDLORD_KEY) || "magnolia";
+  } catch {
+    return "magnolia";
+  }
+}
+
+function residentPassword(lot: Lot) {
+  const custom = (lot.residentPass ?? "").trim();
+  if (custom) return custom;
+  const person = nameParts((lot.name.split(/\s*\/\s*/)[0] ?? "").trim());
+  const first = person.first.replace(/[^A-Za-z]/g, "").charAt(0).toUpperCase();
+  const last = person.last.replace(/[^A-Za-z]/g, "").charAt(0).toUpperCase();
+  const four = (lot.social4 ?? "").replace(/\D/g, "").slice(-4);
+  if (!first || !last || four.length !== 4) return "";
+  return `${first}${last}${four}@&`;
+}
+const STORAGE_AT = "magnolia-lot-edits-at";
+const TODO_DONE_KEY = "magnolia-todo-done";
+const TODO_RANK_KEY = "magnolia-todo-rank";
+const MAP_KEY = "magnolia-last-map";
+const CAMERA_KEY = "magnolia-camera-office";
+const PLANT_CAMERA_KEY = "magnolia-camera-plant";
+const ALARM_KEY = "magnolia-alarm-plant";
+const ALARM_ON_KEY = "magnolia-alarm-on";
+const DEVICE_LINKS = {
+  office: { key: CAMERA_KEY, title: "Blue Iris", label: "Camera link", placeholder: "Paste the Blue Iris link" },
+  plant: { key: PLANT_CAMERA_KEY, title: "Treatment plant camera", label: "Camera link", placeholder: "Paste the Blue Iris link" },
+  alarm: { key: ALARM_KEY, title: "Alarm Connect", label: "Alarm link", placeholder: "Paste the Alarm Connect link" },
+} as const;
+
+function lotChangeText(prev: Lot | undefined, next: Lot) {
+  if (!prev) return "Added the lot";
+  const skip = new Set(["id"]);
+  const changed: string[] = [];
+  const keys = new Set([...Object.keys(prev), ...Object.keys(next)]);
+  for (const key of keys) {
+    if (skip.has(key)) continue;
+    if (JSON.stringify((prev as Record<string, unknown>)[key] ?? "") !== JSON.stringify((next as Record<string, unknown>)[key] ?? "")) changed.push(key);
+  }
+  if (!changed.length) return "";
+  return changed.slice(0, 8).join(", ");
+}
+
+function rememberLots(lots: Lot[]) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(lots));
+    localStorage.setItem(STORAGE_AT, new Date().toISOString());
+  } catch {
+    /* the master file is the copy that matters */
+  }
+}
+
+let masterTimer = 0;
+type SyncState = "local" | "synced" | "saving" | "offline";
+const syncListeners = new Set<(state: SyncState) => void>();
+
+function reportSync(state: SyncState) {
+  syncListeners.forEach((listen) => listen(state));
+}
+
+function listFromStore(store: Record<string, string>, key: string) {
+  try {
+    const raw = JSON.parse(store[key] ?? "null");
+    return Array.isArray(raw) ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function masterPayload(lots: Lot[]) {
+  const store = collectStore();
+  const saved = new Date().toISOString();
+  store["magnolia-lot-edits"] = JSON.stringify(lots);
+  store["magnolia-lot-edits-at"] = saved;
+  return {
+    saved,
+    lots,
+    bills: listFromStore(store, "magnolia-park-bills"),
+    mowings: listFromStore(store, "magnolia-mow-rounds"),
+    board: listFromStore(store, "magnolia-meeting-board"),
+    store,
+  };
+}
+
+async function hostUp() {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return false;
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), 2000);
+  try {
+    const res = await fetch("/favicon.svg", { cache: "no-store", signal: ctrl.signal });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function pushMaster(lots: Lot[]) {
+  rememberLots(lots);
+  reportSync("saving");
+  if (!(await hostUp())) {
+    reportSync("offline");
+    return false;
+  }
+  try {
+    await writeMaster({ data: masterPayload(lots) });
+    reportSync("synced");
+    return true;
+  } catch {
+    reportSync("offline");
+    return false;
+  }
+}
+
+function queueMaster(lots: Lot[]) {
+  window.clearTimeout(masterTimer);
+  masterTimer = window.setTimeout(() => {
+    void pushMaster(lots);
+  }, 400);
+}
+
+function loadLots(): Lot[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return LOTS.map(withEmptyMow);
+    const saved = JSON.parse(raw) as Lot[];
+    const byId = new Map(saved.map((lot) => [lot.id, lot]));
+    return LOTS.map((lot) => {
+      const next = byId.get(lot.id);
+      if (!next) return withEmptyMow(lot);
+      const status: LotStatus =
+        next.status === "Empty" || next.status === "Open" || next.status === "Eviction" ? next.status : "Occupied";
+      return withEmptyMow({ ...lot, ...next, id: lot.id, status, phone: next.phone?.trim() ? next.phone : lot.phone, bouncedCheck: next.bouncedCheck ?? "", maintenance: next.maintenance ?? "", dogs: next.dogs === "1" || next.dogs === "2" ? next.dogs : "", cats: next.cats === "1" || next.cats === "2" ? next.cats : "", wiring: next.wiring === "Yes" || next.wiring === "No" ? next.wiring : "", homeIns: next.homeIns === "Yes" || next.homeIns === "No" ? next.homeIns : "", homeInsDate: next.homeInsDate ?? "", readyPower: next.readyPower === "Yes" ? "Yes" : "", readyClean: next.readyClean === "Yes" ? "Yes" : "", readyInspected: next.readyInspected === "Yes" ? "Yes" : "", zillow: next.zillow === "Yes" || next.zillow === "No" ? next.zillow : "", zillowUrl: next.zillowUrl ?? "", homeYear: next.homeYear ?? "", homeMake: next.homeMake ?? "", homeModel: next.homeModel ?? "", homeWidth: next.homeWidth ?? "", homeLength: next.homeLength ?? "", homeWide: next.homeWide === "Single Wide" || next.homeWide === "Double Wide" ? next.homeWide : "", roofAge: next.roofAge ?? "", roofMaterial: next.roofMaterial ?? "", roofInstalled: next.roofInstalled ?? "", roofReplace: next.roofReplace === "Yes" || next.roofReplace === "No" ? next.roofReplace : "", acCleaning: next.acCleaning ?? "", acService: next.acService ?? "", inspectionDate: next.inspectionDate ?? "", inspectionNotes: next.inspectionNotes ?? "", moveIn: next.moveIn ?? "", rentDue: next.rentDue ?? "", deposit: next.deposit ?? "", balance: next.balance ?? "", noticeDate: next.noticeDate ?? "", noticeNote: next.noticeNote ?? "", photo: next.photo ?? "", lease: next.lease?.data ? next.lease : null, rulesReceipt: next.rulesReceipt?.data ? next.rulesReceipt : null, background: next.background?.data ? next.background : null, otherDocs: Array.isArray(next.otherDocs) ? next.otherDocs : [], leaseEnd: next.leaseEnd ?? "", emergencyName: next.emergencyName ?? "", emergencyPhone: next.emergencyPhone ?? "", courtDate: next.courtDate ?? "", courtNote: next.courtNote ?? "", waitName: next.waitName ?? "", waitPhone: next.waitPhone ?? "", history: Array.isArray(next.history) ? next.history : [], maintLog: Array.isArray(next.maintLog) ? next.maintLog : [], noticeFile: next.noticeFile?.data ? next.noticeFile : null, rentInc2026: next.rentInc2026 ?? "", rentInc2027: next.rentInc2027 ?? "", social4: next.social4 || (lot.id === "8" ? "4821" : "") });
+    });
+  } catch {
+    return LOTS.map(withEmptyMow);
+  }
+}
+
+function printTodo(items: { lot: string; address: string; street: string; name: string; notes: string; text: string; date: string; done: boolean }[]) {
+  const win = window.open("", "_blank");
+  if (!win) return;
+  const rows = noteBands(items)
+    .map(([label, group]) => {
+      const cards = group
+        .map(
+          (item) => `<article class="${item.done ? "done" : ""}">
+        <p class="when">${escapeHtml(item.date ? formatTodoDate(item.date) : "No date")}${item.done ? " · Done" : ""}</p>
+        <p><b>Lot</b> ${escapeHtml(item.lot || "—")}</p>
+        <p><b>Address</b> ${escapeHtml(item.address || "—")}</p>
+        <p><b>Name</b> ${escapeHtml(item.name || "—")}</p>
+        ${item.text ? `<p><b>Due</b> ${escapeHtml(item.text)}</p>` : ""}
+        <p><b>Notes</b> ${escapeHtml(item.notes || "—")}</p>
+      </article>`,
+        )
+        .join("");
+      return `<h2>${escapeHtml(label)}</h2>${cards}`;
+    })
+    .join("");
+  win.document.open();
+  win.document.write(`<!doctype html><html><head><title>To-Do</title><style>
+    @page { size: letter; margin: 0.6in; }
+    body { margin: 0; color: #1c1916; font: 14px/1.4 Georgia, serif; }
+    h1 { margin: 0 0 8px; font-size: 16px; letter-spacing: 0.12em; text-transform: uppercase; }
+    h2 { margin: 18px 0 6px; font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; }
+    article { break-inside: avoid; border-top: 1px solid #ccc; padding: 10px 0; }
+    article.done { color: #1d6b32; background: #d9efd8; padding: 10px; }
+    p { margin: 0 0 2px; }
+    b { display: inline-block; min-width: 4.6rem; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+    .when { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 4px; }
+  </style></head><body>
+    <h1>To-Do</h1>
+    ${rows || "<p>Nothing on the list.</p>"}
+  </body></html>`);
+  win.document.close();
+  const go = () => {
+    if (win.closed) return;
+    win.focus();
+    win.print();
+  };
+  win.onload = () => setTimeout(go, 200);
+  setTimeout(go, 500);
+}
+
+const MAP_PRINT_CSS = `
+  html, body { margin: 0; background: #fff; color: #1c1916; }
+  h1 { margin: 0 0 8px; font: 700 16px sans-serif; letter-spacing: 0.08em; text-transform: uppercase; }
+  svg { width: 100% !important; height: auto !important; max-height: none !important; display: block; }
+  svg text { font-family: "Avenir Next", "Segoe UI", sans-serif; fill: #1c1916; }
+  .lot rect, .lot polygon { fill: #f6f3ec; stroke: #000; stroke-width: 1.9; }
+  .lot.occupied rect, .lot.occupied polygon { fill: rgb(40 175 80 / 14%); }
+  .lot.empty rect, .lot.empty polygon { fill: #b5b5b5; }
+  .lot.open rect, .lot.open polygon { fill: #fff; }
+  .lot.notes rect, .lot.notes polygon { fill: #fff200; }
+  .lot.late rect, .lot.late polygon { fill: #ff5a00; }
+  .lot.maint rect, .lot.maint polygon { fill: url(#maintStripes); }
+  .lot.leak rect, .lot.leak polygon { fill: #2f7bff; }
+  .lot.eviction rect, .lot.eviction polygon { fill: #e10600; }
+  .lot.eviction text { fill: #fff; }
+  .lot.roof rect, .lot.roof polygon { fill: #2f6bff; }
+  .landmark rect { fill: transparent; stroke: #2a2622; stroke-width: 1.5; }
+  .landmark.plant rect { fill: rgb(122 74 32 / 35%); }
+  .road { fill: transparent; stroke: #2a2622; stroke-width: 1.15; }
+  * { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+`;
+
+function mapMarkup(id: SheetId) {
+  const root = document.getElementById(`map-${id}`) ?? document.querySelector(".map-stage");
+  const svg = root?.querySelector("svg");
+  if (!svg) return "";
+  const clone = svg.cloneNode(true) as SVGSVGElement;
+  if (!clone.querySelector("#maintStripes") || !clone.querySelector("#roofStripes")) {
+    const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+    for (const id of ["maintStripes", "roofStripes"]) {
+      if (clone.querySelector(`#${id}`)) continue;
+      const pattern = document.getElementById(id);
+      if (pattern) defs.appendChild(pattern.cloneNode(true));
+    }
+    if (defs.childNodes.length) clone.insertBefore(defs, clone.firstChild);
+  }
+  return new XMLSerializer().serializeToString(clone);
+}
+
+function openMapPrint(title: string, body: string, page: "landscape" | "portrait" | "mixed") {
+  const pageCss =
+    page === "portrait"
+      ? "@page { size: portrait; margin: 0.35in; }"
+      : page === "landscape"
+        ? "@page { size: landscape; margin: 0.35in; }"
+        : "@page land { size: landscape; margin: 0.35in; } @page port { size: portrait; margin: 0.35in; } section.land { page: land; break-after: page; } section.port { page: port; }";
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>${pageCss}${MAP_PRINT_CSS}</style></head><body>${body}</body></html>`;
+  const win = window.open("", "_blank");
+  if (!win) {
+    const blob = new Blob([html], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "magnolia-map.html";
+    link.click();
+    URL.revokeObjectURL(url);
+    return;
+  }
+  win.document.open();
+  win.document.write(html);
+  win.document.close();
+  const go = () => {
+    if (win.closed) return;
+    win.focus();
+    win.print();
+  };
+  win.onload = () => setTimeout(go, 200);
+  setTimeout(go, 400);
+}
+
+function printMap(id: SheetId) {
+  const svg = mapMarkup(id);
+  if (!svg) return;
+  openMapPrint(SHEET_COPY[id].title, `<h1>${escapeHtml(SHEET_COPY[id].title)}</h1>${svg}`, id === 3 ? "portrait" : "landscape");
+}
+
+function escapeHtml(value: string) {
+  const amp = "&" + "amp;";
+  const lt = "&" + "lt;";
+  const gt = "&" + "gt;";
+  const quot = "&" + "quot;";
+  const apos = "&" + "#39;";
+  return value.replace(/&/g, amp).replace(/</g, lt).replace(/>/g, gt).replace(/"/g, quot).replace(/'/g, apos);
+}
+
+function prettyDate(value?: string) {
+  const day = parseDay(value);
+  const date = day ? new Date(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10))) : new Date();
+  return date.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+}
+
+function noteIsToday(text: string) {
+  const raw = text.trim();
+  if (!raw) return false;
+  if (/\btoday\b/i.test(raw)) return true;
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth() + 1;
+  const d = now.getDate();
+  const iso = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  if (raw.includes(iso)) return true;
+  if (new RegExp(`\\b0?${m}[/-]0?${d}[/-](?:${y}|${String(y).slice(2)})\\b`).test(raw)) return true;
+  const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+  const short = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  return new RegExp(`\\b(?:${months[m - 1]}|${short[m - 1]})\\.?\\s+0?${d}\\b`, "i").test(raw);
+}
+
+const NOTICE_KINDS = [
+  ["three", "Three day notice"],
+  ["five", "Five day notice"],
+  ["lawn", "Lawn mow notice"],
+  ["noise", "Noise complaint"],
+  ["other", "Other notice"],
+] as const;
+
+type NoticeKind = (typeof NOTICE_KINDS)[number][0];
+type NoticeForm = { name: string; data: string };
+const NOTICE_FORM_KEY = "magnolia-notice-forms";
+
+function loadNoticeForms(): Partial<Record<NoticeKind, NoticeForm>> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(NOTICE_FORM_KEY) ?? "{}") as Partial<Record<NoticeKind, NoticeForm>>;
+    return raw && typeof raw === "object" ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveNoticeForm(kind: NoticeKind, file: NoticeForm | null) {
+  const next = loadNoticeForms();
+  if (file) next[kind] = file;
+  else delete next[kind];
+  try { localStorage.setItem(NOTICE_FORM_KEY, JSON.stringify(next)); } catch { /* the print still uses this visit */ }
+  return next;
+}
+
+function printNotice(lot: Lot, kind: NoticeKind = "other") {
+  const win = window.open("", "_blank");
+  if (!win) return;
+  const title = NOTICE_KINDS.find((item) => item[0] === kind)?.[1] ?? "Notice";
+  const stored = loadNoticeForms()[kind];
+  const file = stored?.data || lot.noticeFile?.data || "";
+  const attached = file.startsWith("data:image/")
+    ? `<img src="${file}" alt="Notice" />`
+    : file.startsWith("data:application/pdf")
+      ? `<iframe src="${file}" title="Notice"></iframe>`
+      : "";
+  win.document.open();
+  win.document.write(`<!doctype html><html><head><title>${escapeHtml(title)} · Lot ${escapeHtml(lot.lot)}</title><style>
+    @page { size: letter; margin: 0.75in; }
+    body { margin: 0; color: #1c1916; font: 16px/1.45 Georgia, serif; }
+    h1 { margin: 0 0 4px; font-size: 18px; letter-spacing: 0.08em; text-transform: uppercase; }
+    .date { margin: 28px 0; }
+    .who { margin: 0 0 28px; }
+    h2 { margin: 0 0 12px; font-size: 16px; letter-spacing: 0.12em; text-transform: uppercase; }
+    p { margin: 0 0 12px; white-space: pre-wrap; }
+    img { display: block; max-width: 100%; margin-top: 24px; }
+    iframe { width: 100%; height: 70vh; border: 0; margin-top: 24px; }
+  </style></head><body>
+    <h1>Magnolia Central of Florida Estates</h1>
+    <p class="date">${escapeHtml(prettyDate(lot.noticeDate))}</p>
+    <p class="who">${escapeHtml(displayName(lot))}<br>${escapeHtml(`${lot.address} ${lot.street}`.trim())}<br>Lot ${escapeHtml(lot.lot)}</p>
+    <h2>${escapeHtml(title)}</h2>
+    <p>${escapeHtml(lot.noticeNote?.trim() || "This notice is for the resident at the address above.")}</p>
+    ${attached}
+  </body></html>`);
+  win.document.close();
+  const go = () => {
+    if (win.closed) return;
+    win.focus();
+    win.print();
+  };
+  win.onload = () => setTimeout(go, 250);
+  setTimeout(go, 600);
+}
+
+const EXPORT_COLUMNS: { key: keyof Lot; label: string }[] = [
+  { key: "lot", label: "Lot" },
+  { key: "address", label: "Address" },
+  { key: "street", label: "Street" },
+  { key: "name", label: "Name" },
+  { key: "status", label: "Status" },
+  { key: "renter", label: "Renter/Owner" },
+  { key: "rent", label: "Rental Amount" },
+  { key: "lotRent", label: "Lot rent" },
+  { key: "homeRent", label: "Home rent" },
+  { key: "rentInc2026", label: "08/2026" },
+  { key: "rentInc2027", label: "08/2027" },
+  { key: "moveIn", label: "Move-in" },
+  { key: "rentDue", label: "Rent due" },
+  { key: "deposit", label: "Deposit" },
+  { key: "balance", label: "Still owed" },
+  { key: "noticeDate", label: "Notice date" },
+  { key: "noticeNote", label: "Notice note" },
+  { key: "issues", label: "Issues" },
+  { key: "maintenance", label: "Maintenance" },
+  { key: "phone", label: "Phone" },
+  { key: "email", label: "Email" },
+  { key: "noMow", label: "MOW" },
+  { key: "lateRent", label: "Late Rent" },
+  { key: "bouncedCheck", label: "Bounced Check" },
+  { key: "roofAge", label: "Roof age" },
+  { key: "roofMaterial", label: "Roof material" },
+  { key: "roofInstalled", label: "Roof installed" },
+  { key: "roofReplace", label: "Roof needs replaced" },
+  { key: "dogs", label: "Dogs" },
+  { key: "cats", label: "Cats" },
+  { key: "wiring", label: "Home wiring insurance" },
+  { key: "homeIns", label: "Home insurance" },
+  { key: "homeInsDate", label: "Insurance expires" },
+  { key: "readyPower", label: "Power on" },
+  { key: "readyClean", label: "Cleaned" },
+  { key: "readyInspected", label: "Inspected" },
+  { key: "zillow", label: "Listed on Zillow" },
+  { key: "zillowUrl", label: "Zillow link" },
+  { key: "homeYear", label: "Year" },
+  { key: "homeMake", label: "Make" },
+  { key: "homeModel", label: "Model" },
+  { key: "homeWidth", label: "Width" },
+  { key: "homeLength", label: "Length" },
+  { key: "homeWide", label: "Single or double" },
+];
+
+function csvCell(value: string) {
+  return /[",\n\r]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
+function downloadRegister(lots: Lot[]) {
+  const lines = [
+    EXPORT_COLUMNS.map((col) => csvCell(col.label)).join(","),
+    ...lots.map((lot) => EXPORT_COLUMNS.map((col) => csvCell(String(lot[col.key] ?? ""))).join(",")),
+  ];
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "magnolia-register.csv";
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function parseCsv(text: string) {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') {
+        cell += '"';
+        i += 1;
+      } else if (ch === '"') quoted = false;
+      else cell += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (ch === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else if (ch !== "\r") cell += ch;
+  }
+  if (cell || row.length) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows.filter((line) => line.some((item) => item.trim()));
+}
+
+function importRegister(text: string, current: Lot[]) {
+  const rows = parseCsv(text);
+  if (rows.length < 2) return current;
+  const header = rows[0].map((item) => item.trim().toLowerCase());
+  const lotIndex = header.findIndex((item) => item === "lot");
+  if (lotIndex < 0) return current;
+  const keys = header.map((name) => EXPORT_COLUMNS.find((col) => col.label.toLowerCase() === name)?.key);
+  const incoming = new Map<string, Partial<Lot>>();
+  for (const line of rows.slice(1)) {
+    const lotNo = line[lotIndex]?.trim();
+    if (!lotNo) continue;
+    const patch: Partial<Lot> = {};
+    keys.forEach((key, index) => {
+      if (!key || key === "id" || key === "lot") return;
+      (patch as Record<string, string>)[key] = line[index] ?? "";
+    });
+    incoming.set(lotNo, patch);
+  }
+  return current.map((lot) => {
+    const patch = incoming.get(lot.lot);
+    if (!patch) return lot;
+    const status: LotStatus =
+      patch.status === "Empty" || patch.status === "Open" || patch.status === "Eviction" || patch.status === "Occupied"
+        ? patch.status
+        : lot.status;
+    return { ...lot, ...patch, id: lot.id, lot: lot.lot, status, photo: lot.photo, lease: lot.lease, rulesReceipt: lot.rulesReceipt, background: lot.background, otherDocs: lot.otherDocs };
+  });
+}
+
+function readAsData(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function fileToData(file: File) {
+  if (file.type.startsWith("image/")) {
+    const raw = await readAsData(file);
+    return new Promise<string>((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const max = 720;
+        const scale = Math.min(1, max / Math.max(img.width, img.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return resolve(raw);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.72));
+      };
+      img.onerror = () => resolve(raw);
+      img.src = raw;
+    });
+  }
+  if (file.size > 1_200_000) return "";
+  return readAsData(file);
+}
+
+const APP_KEY_PREFIXES = ["magnolia-", "treatmentPlant", "vendorDirectory", "maint-requests", "rent-increases", "broadcast-history", "lease-", "photo-", "shutoff-"];
+
+function isAppKey(key: string) {
+  return APP_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+function collectStore() {
+  const store: Record<string, string> = {};
+  try {
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key || !isAppKey(key)) continue;
+      const value = localStorage.getItem(key);
+      if (value != null) store[key] = value;
+    }
+  } catch {
+    /* a private browser still downloads the lots on screen */
+  }
+  return store;
+}
+
+function restoreStore(store: Record<string, string> | undefined) {
+  if (!store) return;
+  for (const [key, value] of Object.entries(store)) {
+    if (typeof value !== "string" || !isAppKey(key)) continue;
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      /* a full photo can exceed the browser limit; the rest still restores */
+    }
+  }
+}
+
+async function downloadEverything(lots: Lot[]) {
+  const payload = masterPayload(lots);
+  try {
+    const master = await readMaster();
+    if (master?.store) {
+      for (const [key, value] of Object.entries(master.store)) {
+        if (payload.store[key] == null && typeof value === "string") payload.store[key] = value;
+      }
+    }
+    if (!payload.bills && Array.isArray(master?.bills)) payload.bills = master.bills;
+    if (!payload.mowings && Array.isArray(master?.mowings)) payload.mowings = master.mowings;
+    if (!payload.board && Array.isArray(master?.board)) payload.board = master.board;
+  } catch {
+    /* no office computer; the file is still this device's full copy */
+  }
+  const blob = new Blob([JSON.stringify({ ...payload, lots })], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "magnolia-backup.json";
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function importEverything(text: string, current: Lot[]) {
+  const parsed = JSON.parse(text) as { lots?: Lot[]; store?: Record<string, string> } | Lot[];
+  if (!Array.isArray(parsed)) restoreStore(parsed.store);
+  const incoming = Array.isArray(parsed) ? parsed : parsed.lots ?? [];
+  const byId = new Map(incoming.map((lot) => [lot.id, lot]));
+  const seen = new Set<string>();
+  const merged = current.map((lot) => {
+    seen.add(lot.id);
+    const next = byId.get(lot.id);
+    if (!next) return lot;
+    const status: LotStatus =
+      next.status === "Empty" || next.status === "Open" || next.status === "Eviction" ? next.status : "Occupied";
+    return { ...lot, ...next, id: lot.id, status };
+  });
+  for (const lot of incoming) {
+    if (!lot?.id || seen.has(lot.id)) continue;
+    merged.push(lot);
+  }
+  return merged;
+}
+
+function lotNumberIn(text: string) {
+  const match = text.match(/\blot\s*#?\s*(\d+(?:\.5)?)\b/i);
+  return match?.[1] ?? "";
+}
+
+function lastToken(name: string) {
+  const head = name.split(",")[0]?.trim() || name.trim();
+  return head.split(/\s+/).pop()?.toLowerCase() ?? "";
+}
+
+function moneyText(value: number) {
+  const rounded = Math.round(value * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
+}
+
+function importFromQuickBooks(text: string, current: Lot[]) {
+  const hits = parseQuickBooks(text);
+  const used = new Set<string>();
+  let updated = 0;
+  let missed = 0;
+  const next = current.map((lot) => ({ ...lot }));
+  for (const hit of hits) {
+    const lot = matchQuickBooksLot(next, hit);
+    if (!lot || used.has(lot.id)) {
+      missed += 1;
+      continue;
+    }
+    used.add(lot.id);
+    let changed = false;
+    if (hit.phone && hit.phone !== lot.phone) {
+      lot.phone = hit.phone;
+      changed = true;
+    }
+    if (hit.email && hit.email !== lot.email) {
+      lot.email = hit.email;
+      changed = true;
+    }
+    if (hit.balance != null) {
+      const shown = moneyText(hit.balance);
+      if (shown !== (lot.balance ?? "")) {
+        lot.balance = shown;
+        changed = true;
+      }
+    } else if (hit.paid && hit.paid > 0) {
+      const owed = Number(String(lot.balance ?? "").replace(/[$,]/g, ""));
+      if (Number.isFinite(owed)) {
+        lot.balance = moneyText(Math.max(0, owed - hit.paid));
+        changed = true;
+      }
+    }
+    if (changed) updated += 1;
+  }
+  return { lots: next, updated, missed };
+}
+
+type QbHit = { lotNo: string; name: string; phone: string; email: string; balance: number | null; paid: number };
+
+function parseQuickBooks(text: string): QbHit[] {
+  if (/(^|\n)!?(CUST|TRNS|ENDTRNS)\b/.test(text) && text.includes("\t")) return parseIif(text);
+  return parseQuickBooksCsv(text);
+}
+
+function parseIif(text: string): QbHit[] {
+  const byName = new Map<string, QbHit>();
+  let headers: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const cols = line.split("\t");
+    if (line.startsWith("!")) {
+      headers = cols.map((col) => col.replace(/^!/, "").toUpperCase());
+      continue;
+    }
+    const rec: Record<string, string> = {};
+    headers.forEach((header, index) => {
+      if (header) rec[header] = cols[index] ?? "";
+    });
+    const kind = (cols[0] ?? "").toUpperCase();
+    if (kind === "CUST") {
+      const name = rec.NAME || rec.COMPANYNAME || "";
+      const hit = byName.get(name.toLowerCase()) ?? blankHit(name);
+      hit.lotNo = hit.lotNo || lotNumberIn([name, rec.NOTE, rec.BADDR1, rec.BADDR2, rec.BADDR3].join(" "));
+      hit.phone = hit.phone || rec.PHONE1 || rec.PHONE || "";
+      hit.email = hit.email || rec.EMAIL || "";
+      const balance = numberOrNull(rec.BALANCE || rec.OPENBALANCE || "");
+      if (balance != null) hit.balance = balance;
+      byName.set(name.toLowerCase(), hit);
+    }
+    if (kind === "TRNS" && (rec.TRNSTYPE || "").toUpperCase() === "PAYMENT") {
+      const name = rec.NAME || "";
+      const hit = byName.get(name.toLowerCase()) ?? blankHit(name);
+      hit.lotNo = hit.lotNo || lotNumberIn(`${name} ${rec.MEMO ?? ""} ${rec.DOCNUM ?? ""}`);
+      const paid = numberOrNull(rec.AMOUNT || "");
+      if (paid != null) hit.paid += Math.abs(paid);
+      byName.set(name.toLowerCase(), hit);
+    }
+  }
+  return [...byName.values()].filter((hit) => hit.name || hit.lotNo);
+}
+
+function parseQuickBooksCsv(text: string): QbHit[] {
+  const rows = parseCsv(text);
+  if (rows.length < 2) return [];
+  const header = rows[0].map((cell) => cell.trim().toLowerCase());
+  const col = (...names: string[]) => header.findIndex((cell) => names.some((name) => cell.includes(name)));
+  const nameCol = col("customer", "name");
+  const phoneCol = col("phone");
+  const emailCol = col("email", "e-mail");
+  const balanceCol = col("balance", "open balance", "amount due");
+  const lotCol = col("lot");
+  if (nameCol < 0 && lotCol < 0) return [];
+  return rows.slice(1).map((row) => {
+    const name = row[nameCol] ?? "";
+    return {
+      lotNo: lotNumberIn(`${row[lotCol] ?? ""} ${name}`),
+      name,
+      phone: phoneCol >= 0 ? row[phoneCol] ?? "" : "",
+      email: emailCol >= 0 ? row[emailCol] ?? "" : "",
+      balance: balanceCol >= 0 ? numberOrNull(row[balanceCol] ?? "") : null,
+      paid: 0,
+    };
+  });
+}
+
+function blankHit(name: string): QbHit {
+  return { lotNo: lotNumberIn(name), name, phone: "", email: "", balance: null, paid: 0 };
+}
+
+function numberOrNull(value: string) {
+  const cleaned = value.replace(/[$,\s]/g, "");
+  if (!cleaned || cleaned === "-") return null;
+  const amount = Number(cleaned);
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function matchQuickBooksLot(lots: Lot[], hit: QbHit) {
+  if (hit.lotNo) {
+    const byLot = lots.find((lot) => lot.lot === hit.lotNo);
+    if (byLot) return byLot;
+  }
+  const stripped = hit.name.replace(/^lot\s*\d+(?:\.5)?\s*[-–:]?\s*/i, "").trim();
+  const token = lastToken(stripped);
+  if (!token || token.length < 2) return undefined;
+  const named = lots.filter((lot) => {
+    const lotToken = lastToken(lot.name);
+    return lotToken === token || lot.name.trim().toLowerCase() === stripped.toLowerCase();
+  });
+  return named.length === 1 ? named[0] : undefined;
+}
+
+const BUSINESS_CATEGORIES = ["License / permit", "Vehicle", "Title work", "Insurance", "Tax / bill", "Maintenance", "Inspection", "Vendor", "Other"];
+const BUSINESS_STATUSES = ["Open", "In progress", "Waiting", "Completed"];
+const BUSINESS_KEY = "magnolia-business-tasks";
+
+function businessDays(date: string) {
+  if (!date) return null;
+  const value = new Date(date + "T00:00:00");
+  if (!Number.isFinite(value.getTime())) return null;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  return Math.round((value.getTime() - today.getTime()) / 86400000);
+}
+
+function readFileBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = typeof reader.result === "string" ? reader.result : "";
+      const comma = value.indexOf(",");
+      if (comma < 0) reject(new Error("The selected file could not be read."));
+      else resolve(value.slice(comma + 1));
+    };
+    reader.onerror = () => reject(new Error("The selected file could not be read."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function noteTasksFromLots(lots: Lot[]): BusinessTask[] {
+  return buildTodo(lots).flatMap((item) => {
+    const hay = `${item.notes}\n${item.text}`;
+    const hit = (["title", "insurance", "power"] as const).find((word) => new RegExp(`\\b${word}`, "i").test(hay));
+    if (!hit) return [];
+    const category = hit === "title" ? "Title work" : hit === "insurance" ? "Insurance" : "Other";
+    const who = item.name && item.name !== "—" ? item.name : "";
+    const label = hit[0].toUpperCase() + hit.slice(1);
+    return [{
+      id: `lot-note:${item.id}`,
+      title: `Lot ${item.lot}${who ? ` · ${who}` : ""} · ${label}`,
+      category,
+      dueDate: item.date,
+      followUp: "",
+      status: "Open",
+      owner: who,
+      cost: "",
+      reference: item.address || item.lot,
+      notes: [item.notes, item.text].filter(Boolean).join(" · "),
+    }];
+  });
+}
+
+function BusinessBoard({ lots }: { lots: Lot[] }) {
+  const [tasks, setTasks] = useState<BusinessTask[]>([]);
+  const [parkBills, setParkBills] = useState<ParkBill[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [storageError, setStorageError] = useState("");
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [filter, setFilter] = useState("All");
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [hiddenTasks, setHiddenTasks] = useState<Set<string>>(() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem("magnolia-business-hidden") ?? "[]");
+      return new Set(Array.isArray(raw) ? raw.filter((id) => typeof id === "string") : []);
+    } catch {
+      return new Set();
+    }
+  });
+  const [search, setSearch] = useState("");
+  const [title, setTitle] = useState("");
+  const [category, setCategory] = useState("Title work");
+  const [dueDate, setDueDate] = useState("");
+  const [followUp, setFollowUp] = useState("");
+  const [owner, setOwner] = useState("");
+  const [cost, setCost] = useState("");
+  const [reference, setReference] = useState("");
+  const [notes, setNotes] = useState("");
+  const [attachments, setAttachments] = useState<Record<string, BusinessAttachment[]>>({});
+  const [history, setHistory] = useState<Record<string, BusinessHistoryEntry[]>>({});
+  const [expandedAttachments, setExpandedAttachments] = useState<Record<string, boolean>>({});
+  const [expandedHistory, setExpandedHistory] = useState<Record<string, boolean>>({});
+  const [legacyCount, setLegacyCount] = useState(0);
+  const [dismissedNotes, setDismissedNotes] = useState<Set<string>>(() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem("magnolia-business-note-dismissed") ?? "[]");
+      return new Set(Array.isArray(raw) ? raw.filter((id) => typeof id === "string") : []);
+    } catch {
+      return new Set();
+    }
+  });
+  const boardTasks = useMemo(() => {
+    const saved = new Set(tasks.map((task) => task.id));
+    const fromNotes = noteTasksFromLots(lots).filter((task) => !saved.has(task.id) && !dismissedNotes.has(task.id) && !hiddenTasks.has(task.id));
+    return [...fromNotes, ...tasks.filter((task) => !hiddenTasks.has(task.id))];
+  }, [lots, tasks, dismissedNotes, hiddenTasks]);
+  const [board, setBoard] = useState<BoardNote[]>(() => (typeof window === "undefined" ? [] : loadBoard()));
+  function removeSticky(task: BusinessTask, id: string) {
+    eraseTaskSticky(id);
+    dismissSticky(id);
+    const nextBoard = loadBoard().filter((note) => note.id !== id);
+    setBoard(nextBoard);
+    try {
+      localStorage.setItem(BOARD_KEY, JSON.stringify(nextBoard));
+    } catch {
+      /* the on-screen list is already updated */
+    }
+    void saveBoard({ data: { board: nextBoard } }).catch(() => {});
+    if (task.notes.includes(id)) {
+      const notesText = task.notes.split("\n").filter((line) => !line.includes(id)).join("\n").trim();
+      const next = { ...task, notes: notesText };
+      setTasks((current) => current.map((item) => (item.id === task.id ? next : item)));
+      void saveBusinessTask({ data: { task: next, action: "Updated" } }).catch(() => {});
+    }
+  }
+  useEffect(() => {
+    const refresh = () => setBoard(loadBoard());
+    refresh();
+    window.addEventListener("focus", refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    try {
+      const legacy = JSON.parse(localStorage.getItem(BUSINESS_KEY) ?? "[]");
+      if (Array.isArray(legacy) && !localStorage.getItem(BUSINESS_KEY + "-imported")) {
+        setLegacyCount(legacy.filter((item) => item && typeof item.title === "string").length);
+      }
+    } catch { /* ignore malformed legacy browser data */ }
+    void listBusinessTasks().then((rows) => {
+      if (!active) return;
+      setTasks(rows.filter((row) => !hiddenTasks.has(row.id)));
+      setLoading(false);
+    }).catch((error: unknown) => {
+      if (!active) return;
+      setStorageError(error instanceof Error ? error.message : "Shared task storage is unavailable.");
+      setLoading(false);
+    });
+    return () => { active = false; };
+  }, []);
+
+  const active = boardTasks.filter((task) => task.status !== "Completed");
+  const overdue = active.filter((task) => { const days = businessDays(task.dueDate); return days !== null && days < 0; });
+  const upcoming = active.filter((task) => { const days = businessDays(task.dueDate); return days !== null && days >= 0 && days <= 30; });
+  const followUpsDue = active.filter((task) => { const days = businessDays(task.followUp); return days !== null && days <= 0; });
+  const waiting = active.filter((task) => task.status === "Waiting");
+  const filtered = boardTasks.filter((task) => (
+    filter === "All" || task.category === filter || task.status === filter ||
+    (filter === "Overdue" && task.status !== "Completed" && businessDays(task.dueDate) !== null && businessDays(task.dueDate)! < 0) ||
+    (filter === "Due soon" && task.status !== "Completed" && businessDays(task.dueDate) !== null && businessDays(task.dueDate)! >= 0 && businessDays(task.dueDate)! <= 30) ||
+    (filter === "Follow-up due" && task.status !== "Completed" && businessDays(task.followUp) !== null && businessDays(task.followUp)! <= 0)
+  ) && [task.title, task.category, task.owner, task.reference, task.notes].join(" ").toLowerCase().includes(search.trim().toLowerCase())).sort((a, b) => {
+    if (a.status === "Completed" && b.status !== "Completed") return 1;
+    if (b.status === "Completed" && a.status !== "Completed") return -1;
+    return (businessDays(a.dueDate) ?? 99999) - (businessDays(b.dueDate) ?? 99999);
+  });
+
+  async function addTask(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!title.trim()) return;
+    setSaving(true); setStorageError("");
+    const existing = editingId ? tasks.find((item) => item.id === editingId) : undefined;
+    const task: BusinessTask = {
+      id: existing?.id ?? crypto.randomUUID(), title: title.trim(), category, dueDate, followUp,
+      status: existing?.status ?? "Open", owner: owner.trim(), cost: cost.trim(), reference: reference.trim(), notes: notes.trim(),
+    };
+    try {
+      const saved = await saveBusinessTask({ data: { task, action: existing ? "Updated" : "Created" } });
+      setTasks((current) => existing ? current.map((item) => item.id === saved.id ? saved : item) : [saved, ...current]);
+      setTitle(""); setDueDate(""); setFollowUp(""); setOwner(""); setCost(""); setReference(""); setNotes("");
+      setCategory("Title work"); setShowForm(false); setEditingId(null);
+    } catch (error) {
+      setStorageError(error instanceof Error ? error.message : "Task could not be saved.");
+    } finally { setSaving(false); }
+  }
+
+  async function changeStatus(task: BusinessTask, status: string) {
+    const next = { ...task, status };
+    setStorageError("");
+    try {
+      const saved = await saveBusinessTask({ data: { task: next, action: "Updated" } });
+      setTasks((current) => current.some((item) => item.id === saved.id) ? current.map((item) => item.id === saved.id ? saved : item) : [saved, ...current]);
+      setHistory((current) => { const copy = { ...current }; delete copy[task.id]; return copy; });
+    } catch (error) {
+      setStorageError(error instanceof Error ? error.message : "Task status could not be saved.");
+    }
+  }
+
+  function beginEdit(task: BusinessTask) {
+    setEditingId(task.id);
+    setTitle(task.title); setCategory(task.category); setDueDate(task.dueDate); setFollowUp(task.followUp);
+    setOwner(task.owner); setCost(task.cost); setReference(task.reference); setNotes(task.notes);
+    setShowForm(true);
+    setStorageError("");
+  }
+
+  async function removeTask(task: BusinessTask) {
+    setConfirmId(null);
+    setHiddenTasks((current) => {
+      const next = new Set(current);
+      next.add(task.id);
+      localStorage.setItem("magnolia-business-hidden", JSON.stringify([...next]));
+      return next;
+    });
+    if (task.id.startsWith("lot-note:")) {
+      setDismissedNotes((current) => {
+        const next = new Set(current);
+        next.add(task.id);
+        localStorage.setItem("magnolia-business-note-dismissed", JSON.stringify([...next]));
+        return next;
+      });
+    }
+    setTasks((current) => current.filter((item) => item.id !== task.id));
+    if (task.id.startsWith("lot-note:") && !tasks.some((item) => item.id === task.id)) return;
+    try {
+      await deleteBusinessTask({ data: { id: task.id } });
+      setAttachments((current) => { const copy = { ...current }; delete copy[task.id]; return copy; });
+      setHistory((current) => { const copy = { ...current }; delete copy[task.id]; return copy; });
+    } catch (error) {
+      setStorageError(error instanceof Error ? error.message : "Task could not be removed from shared storage, but it is hidden here.");
+    }
+  }
+
+  async function toggleAttachments(taskId: string) {
+    const open = !expandedAttachments[taskId];
+    setExpandedAttachments((current) => ({ ...current, [taskId]: open }));
+    if (open && !attachments[taskId]) {
+      try {
+        const rows = await listBusinessAttachments({ data: { taskId } });
+        setAttachments((current) => ({ ...current, [taskId]: rows }));
+      } catch (error) { setStorageError(error instanceof Error ? error.message : "Attachments could not be loaded."); }
+    }
+  }
+
+  async function uploadAttachment(task: BusinessTask, file?: File) {
+    if (!file) return;
+    setStorageError("");
+    try {
+      const dataBase64 = await readFileBase64(file);
+      const attachment = await addBusinessAttachment({ data: {
+        taskId: task.id, name: file.name, mimeType: file.type || "application/octet-stream",
+        size: file.size, dataBase64,
+      }});
+      setAttachments((current) => ({ ...current, [task.id]: [attachment, ...(current[task.id] ?? [])] }));
+      setExpandedAttachments((current) => ({ ...current, [task.id]: true }));
+    } catch (error) {
+      setStorageError(error instanceof Error ? error.message : "Attachment could not be uploaded.");
+    }
+  }
+
+  async function downloadAttachment(attachment: BusinessAttachment) {
+    try {
+      const file = await readBusinessAttachment({ data: { id: attachment.id } });
+      if (!file) throw new Error("Attachment not found.");
+      const binary = atob(file.dataBase64);
+      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+      const url = URL.createObjectURL(new Blob([bytes], { type: file.mimeType }));
+      const link = document.createElement("a"); link.href = url; link.download = file.name; link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) { setStorageError(error instanceof Error ? error.message : "Attachment could not be downloaded."); }
+  }
+
+  async function removeAttachment(taskId: string, attachmentId: string) {
+    try {
+      await deleteBusinessAttachment({ data: { id: attachmentId } });
+      setAttachments((current) => ({ ...current, [taskId]: (current[taskId] ?? []).filter((item) => item.id !== attachmentId) }));
+    } catch (error) { setStorageError(error instanceof Error ? error.message : "Attachment could not be removed."); }
+  }
+
+  async function toggleHistory(taskId: string) {
+    const open = !expandedHistory[taskId];
+    setExpandedHistory((current) => ({ ...current, [taskId]: open }));
+    if (open && !history[taskId]) {
+      try {
+        const rows = await listBusinessHistory({ data: { taskId } });
+        setHistory((current) => ({ ...current, [taskId]: rows }));
+      } catch (error) { setStorageError(error instanceof Error ? error.message : "Change history could not be loaded."); }
+    }
+  }
+
+  async function importLegacyTasks() {
+    let legacy: unknown;
+    try { legacy = JSON.parse(localStorage.getItem(BUSINESS_KEY) ?? "[]"); } catch { legacy = []; }
+    if (!Array.isArray(legacy) || !legacy.length) { setLegacyCount(0); return; }
+    if (!window.confirm("Import tasks saved in this browser into the currently signed-in account? This does not delete the browser copy.")) return;
+    setSaving(true); setStorageError("");
+    try {
+      const imported: BusinessTask[] = [];
+      for (const raw of legacy) {
+        if (!raw || typeof raw !== "object") continue;
+        const old = raw as Partial<BusinessTask>;
+        if (!old.title || !old.category) continue;
+        const task: BusinessTask = {
+          id: crypto.randomUUID(), title: String(old.title).slice(0, 200),
+          category: BUSINESS_CATEGORIES.includes(String(old.category)) ? String(old.category) : "Other",
+          dueDate: String(old.dueDate ?? ""), followUp: String(old.followUp ?? ""),
+          status: BUSINESS_STATUSES.includes(String(old.status)) ? String(old.status) : "Open",
+          owner: String(old.owner ?? ""), cost: String(old.cost ?? ""), reference: String(old.reference ?? ""), notes: String(old.notes ?? ""),
+        };
+        imported.push(await saveBusinessTask({ data: { task, action: "Created" } }));
+      }
+      setTasks((current) => [...imported, ...current]);
+      localStorage.setItem(BUSINESS_KEY + "-imported", new Date().toISOString());
+      setLegacyCount(0);
+    } catch (error) {
+      setStorageError(error instanceof Error ? error.message : "Some legacy tasks could not be imported.");
+    } finally { setSaving(false); }
+  }
+
+  function exportTasks() {
+    const headers = ["Task", "Category", "Due date", "Follow-up date", "Status", "Responsible", "Cost", "Reference", "Notes"];
+    const rows = boardTasks.map((task) => [task.title, task.category, task.dueDate, task.followUp, task.status, task.owner, task.cost, task.reference, task.notes]);
+    const csv = [headers, ...rows].map((row) => row.map((cell) => '"' + String(cell ?? "").replace(/"/g, '""') + '"').join(",")).join("\r\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const link = document.createElement("a"); link.href = url; link.download = "business-task-tracker.csv"; link.click(); URL.revokeObjectURL(url);
+  }
+
+  return <div className="business-board">
+    <div className="business-metrics">
+      <button className="business-metric metric-overdue" type="button" onClick={() => setFilter("Overdue")}><span>Overdue</span><strong>{overdue.length}</strong><small>Past due · incomplete</small></button>
+      <button className="business-metric" type="button" onClick={() => setFilter("Due soon")}><span>Due in 30 days</span><strong>{upcoming.length}</strong><small>Upcoming deadlines</small></button>
+      <button className="business-metric" type="button" onClick={() => setFilter("Follow-up due")}><span>Follow-up due</span><strong>{followUpsDue.length}</strong><small>Check on the next action</small></button>
+      <button className="business-metric" type="button" onClick={() => setFilter("Title work")}><span>Open title work</span><strong>{active.filter((task) => task.category === "Title work").length}</strong><small>Transfers and documents</small></button>
+    </div>
+    <div className="business-heading"><div><p className="eyebrow">OPERATIONS WORKSPACE</p><h2>Business center</h2><p className="business-subtitle">Shared renewals, title work, registrations, documents, and follow-ups.</p></div></div>
+    {storageError ? <div className="business-error" role="alert">{storageError}<button className="business-secondary" type="button" onClick={() => setStorageError("")}>Dismiss</button></div> : null}
+    {legacyCount > 0 ? <div className="business-notice"><span>{legacyCount} older task(s) were found in this browser and have not been moved to shared storage.</span><button className="business-secondary" type="button" disabled={saving} onClick={() => void importLegacyTasks()}>Import to my account</button></div> : null}
+    <div className="business-list-head"><div><h3>Business task register</h3><p>{loading ? "Loading shared records…" : filtered.length + " records · nearest deadline first"}</p></div><div className="business-heading-actions"><div className="map-slot business-filter-drop"><button className="business-secondary" type="button" aria-expanded={filtersOpen} onClick={() => setFiltersOpen((open) => !open)}>{filter === "All" ? "Filter" : filter} ▾</button>{filtersOpen ? <div className="map-drop" role="menu">{[["All", "All tasks"], ["Overdue", "Overdue"], ["Due soon", "Due in 30 days"], ["Follow-up due", "Follow-up due"], ...BUSINESS_CATEGORIES.map((item) => [item, item] as [string, string]), ...BUSINESS_STATUSES.map((item) => [item, item] as [string, string])].map(([id, name]) => <button key={id} type="button" role="menuitemradio" aria-checked={filter === id} onClick={() => { setFilter(id); setFiltersOpen(false); }}>{name}</button>)}</div> : null}</div><input aria-label="Search business tasks" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search tasks, people, references…" /><button className="business-secondary" type="button" onClick={exportTasks}>Export CSV</button><button className="business-primary" type="button" onClick={() => setShowForm((open) => !open)}>{showForm ? "Cancel" : "+ Add task"}</button></div></div>
+    {showForm ? <form className="business-form" onSubmit={(event) => void addTask(event)}><div className="business-form-title"><div><h3>{editingId ? "Edit business task" : "Create business task"}</h3><p>Track the deadline, next action, and reference details.</p></div></div>
+      <label className="business-field business-field-wide">Task name<input required autoFocus value={title} onChange={(event) => setTitle(event.target.value)} placeholder="e.g. Submit title transfer for Lot 24" /></label>
+      <label className="business-field">Category<select value={category} onChange={(event) => setCategory(event.target.value)}>{BUSINESS_CATEGORIES.map((item) => <option key={item}>{item}</option>)}</select></label>
+      <label className="business-field">Due date<input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} /></label>
+      <label className="business-field">Follow-up date<input type="date" value={followUp} onChange={(event) => setFollowUp(event.target.value)} /></label>
+      <label className="business-field">Responsible person<input value={owner} onChange={(event) => setOwner(event.target.value)} placeholder="Name or team" /></label>
+      <label className="business-field">Cost / fee ($)<input inputMode="decimal" value={cost} onChange={(event) => setCost(event.target.value)} placeholder="0.00" /></label>
+      <label className="business-field">Reference number<input value={reference} onChange={(event) => setReference(event.target.value)} placeholder="VIN, title case, permit #" /></label>
+      <label className="business-field business-field-wide">Notes<textarea rows={3} value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Missing documents, agency contact, next action…" /></label>
+      <div className="business-form-actions"><button className="business-secondary" type="button" onClick={() => { setShowForm(false); setEditingId(null); }}>Cancel</button><button className="business-primary" type="submit" disabled={saving}>{saving ? "Saving…" : editingId ? "Save changes" : "Save task"}</button></div>
+    </form> : null}
+    {loading ? <div className="business-empty"><h3>Loading your shared task register</h3><p>Checking the shared database…</p></div> : filtered.length ? <div className="business-task-list">{filtered.map((task) => { const days = businessDays(task.dueDate); const followDays = businessDays(task.followUp); const dueLabel = days === null ? "No due date" : days < 0 ? Math.abs(days) + "d overdue" : days === 0 ? "Due today" : days === 1 ? "Due tomorrow" : "Due in " + days + " days"; return <article className={"business-task " + (task.status === "Completed" ? "task-completed" : "")} key={task.id}>
+      <div className="business-task-main"><span className="business-category">{task.category}</span><h4>{task.title}</h4><div className="business-task-meta">{task.owner ? <span>Owner: {task.owner}</span> : null}{task.reference ? <span>Ref: {task.reference}</span> : null}{task.cost ? <span>{"Fee: $" + task.cost}</span> : null}{task.followUp ? <span>Follow-up: {task.followUp}{followDays !== null && followDays <= 0 && task.status !== "Completed" ? " · due now" : ""}</span> : null}</div>{task.notes.replace(/\[\[sticky:[^\]]+\]\]/g, "").trim() ? <p className="business-task-notes">{task.notes.replace(/\[\[sticky:[^\]]+\]\]/g, "").trim()}</p> : null}{[...(loadTaskStickies()[task.id] ?? []), ...board.filter((note) => note.kind === "pin" && note.pin === `task:${task.id}`).map((note) => ({ id: note.id, text: note.text, color: note.color }))].filter((sticky, index, list) => !loadDismissedStickies().has(sticky.id) && list.findIndex((item) => item.id === sticky.id) === index).map((sticky) => <p className="business-task-notes task-sticky" key={sticky.id} style={{ background: sticky.color }}>{sticky.text}<button type="button" aria-label="Remove sticky" onClick={() => removeSticky(task, sticky.id)}>×</button></p>)}
+        <div className="business-inline-actions"><button className="business-secondary" type="button" onClick={() => void toggleAttachments(task.id)}>{expandedAttachments[task.id] ? "Hide documents" : "Documents (" + (attachments[task.id]?.length ?? "…") + ")"}</button><button className="business-secondary" type="button" onClick={() => void toggleHistory(task.id)}>{expandedHistory[task.id] ? "Hide history" : "Change history"}</button></div>
+        {expandedAttachments[task.id] ? <div className="business-detail-panel"><label className="business-field">Attach PDF or image (max 3 MB)<input type="file" accept="application/pdf,image/png,image/jpeg,image/webp" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; void uploadAttachment(task, file); }} /></label>{(attachments[task.id] ?? []).map((item) => <div className="business-attachment" key={item.id}><span>{item.name} · {(item.size / 1024).toFixed(0)} KB</span><button className="business-secondary" type="button" onClick={() => void downloadAttachment(item)}>Download</button><button className="business-delete" type="button" onClick={() => void removeAttachment(task.id, item.id)}>Remove</button></div>)}</div> : null}
+        {expandedHistory[task.id] ? <div className="business-detail-panel"><h5>Recent changes</h5>{(history[task.id] ?? []).length ? (history[task.id] ?? []).map((entry) => <div className="business-history-entry" key={entry.id}><strong>{entry.action}</strong><span>{new Date(entry.changedAt).toLocaleString()}</span><small>{entry.snapshot.title || "Task record"}</small></div>) : <p>No change history available.</p>}</div> : null}
+      </div>
+      <div className="business-task-actions"><div className={"business-due " + (days !== null && days < 0 && task.status !== "Completed" ? "due-overdue" : days !== null && days <= 7 && task.status !== "Completed" ? "due-soon" : "")}>{task.status === "Completed" ? "Completed" : dueLabel}</div><button className="business-secondary" type="button" onClick={() => beginEdit(task)}>Edit</button><select aria-label={"Status for " + task.title} value={task.status} onChange={(event) => void changeStatus(task, event.target.value)}>{BUSINESS_STATUSES.map((item) => <option key={item}>{item}</option>)}</select>{confirmId === task.id ? <span className="remove-confirm"><span>Are you sure?</span><button className="business-primary" type="button" onClick={() => void removeTask(task)}>Confirm</button><button className="business-secondary" type="button" onClick={() => setConfirmId(null)}>Cancel</button></span> : <button className="business-delete" type="button" onClick={() => setConfirmId(task.id)} aria-label={"Delete " + task.title}>Remove</button>}</div>
+    </article>; })}</div> : <div className="business-empty"><div className="business-empty-icon">✓</div><h3>{tasks.length ? "No matching tasks" : "Your business task list is ready"}</h3><p>{tasks.length ? "Try another search or filter." : "Add a license renewal, vehicle registration, title transfer, or follow-up to start tracking deadlines."}</p>{!tasks.length ? <button className="business-primary" type="button" onClick={() => setShowForm(true)}>+ Add your first task</button> : <button className="business-secondary" type="button" onClick={() => { setSearch(""); setFilter("All"); }}>Clear filters</button>}</div>}
+    <BillsBoard onChange={setParkBills}>
+      <BusinessCalendar
+        tasks={[
+          ...boardTasks,
+          ...board.filter((note) => note.kind === "reminder" && note.when).map((note) => ({ id: note.id, title: note.text, category: "Other", dueDate: note.when, followUp: "", status: "Open", owner: "", cost: "", reference: "", notes: note.text })),
+        ]}
+        bills={parkBills}
+        pins={board.filter((note) => note.kind === "pin" && note.pin?.startsWith("date:"))}
+      />
+    </BillsBoard>
+    <p className="business-storage-note">Tasks, change history, and attachments are stored in the shared database and scoped to the signed-in account. Due-date reminders appear in this workspace; external email or push notifications require a separately configured delivery provider.</p>
+  </div>;
+}
+
+type BoardNote = { id: string; kind: "message" | "sticky" | "reminder" | "pin"; text: string; when: string; color: string; x?: number; y?: number; pin?: string };
+
+const BOARD_KEY = "magnolia-meeting-board";
+const HOA_BOARD_KEY = "magnolia-hoa-board";
+const TASK_STICKY_KEY = "magnolia-task-stickies";
+const DISMISSED_STICKY_KEY = "magnolia-dismissed-stickies";
+type TaskSticky = { id: string; text: string; color: string };
+
+function loadDismissedStickies(): Set<string> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DISMISSED_STICKY_KEY) ?? "[]") as unknown;
+    return new Set(Array.isArray(raw) ? raw.filter((id) => typeof id === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function dismissSticky(id: string) {
+  const next = loadDismissedStickies();
+  next.add(id);
+  localStorage.setItem(DISMISSED_STICKY_KEY, JSON.stringify([...next]));
+}
+
+function loadTaskStickies(): Record<string, TaskSticky[]> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(TASK_STICKY_KEY) ?? "{}") as Record<string, TaskSticky[]>;
+    return raw && typeof raw === "object" ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeTaskSticky(taskId: string, sticky: TaskSticky) {
+  const all = loadTaskStickies();
+  const list = Array.isArray(all[taskId]) ? all[taskId] : [];
+  if (!list.some((item) => item.id === sticky.id)) all[taskId] = [...list, sticky];
+  localStorage.setItem(TASK_STICKY_KEY, JSON.stringify(all));
+}
+
+function eraseTaskSticky(id: string) {
+  const all = loadTaskStickies();
+  for (const key of Object.keys(all)) all[key] = (all[key] ?? []).filter((item) => item.id !== id);
+  localStorage.setItem(TASK_STICKY_KEY, JSON.stringify(all));
+}
+const STICKY_COLORS = [
+  "rgba(240, 130, 0, 0.76)",
+  "rgba(170, 255, 0, 0.7)",
+  "rgba(70, 160, 255, 0.62)",
+  "rgba(255, 64, 64, 0.55)",
+  "rgba(255, 230, 40, 0.75)",
+];
+const MESSAGE_INK: Record<string, string> = {
+  "rgba(240, 130, 0, 0.76)": "#9a3e00",
+  "rgba(170, 255, 0, 0.7)": "#2f5c00",
+  "rgba(70, 160, 255, 0.62)": "#0d47a1",
+  "rgba(255, 64, 64, 0.55)": "#9b1c1c",
+  "rgba(255, 230, 40, 0.75)": "#6b4e00",
+};
+function messageInk(color: string) {
+  return MESSAGE_INK[color] || (/^#|^rgb/.test(color) ? color : "#111");
+}
+
+function postResidentBroadcast(title: string, message: string) {
+  const note: BoardNote = {
+    id: `alert-${Date.now()}`,
+    kind: "message",
+    text: `EMERGENCY: ${title}. ${message}`.trim(),
+    when: new Date().toISOString(),
+    color: "#9f1d16",
+  };
+  try {
+    const saved = loadBoard(HOA_BOARD_KEY).filter((item) => item.text !== note.text);
+    localStorage.setItem(HOA_BOARD_KEY, JSON.stringify([note, ...saved]));
+  } catch {
+    /* the email or text still opens */
+  }
+}
+
+function loadBoard(key = BOARD_KEY): BoardNote[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(key) ?? "[]") as BoardNote[];
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((item) => item && typeof item.text === "string" && (item.kind === "message" || item.kind === "sticky" || item.kind === "reminder" || item.kind === "pin"));
+  } catch {
+    return [];
+  }
+}
+
+function PinMarks({ notes, pin, open, onOpen, onRemove }: { notes: BoardNote[]; pin: string; open: string; onOpen: (id: string) => void; onRemove: (id: string) => void }) {
+  const pins = notes.filter((note) => note.kind === "pin" && note.pin === pin);
+  if (!pins.length) return null;
+  return (
+    <span className="pin-marks">
+      {pins.map((item) => (
+        <span className="pin-wrap" key={item.id}>
+          <button type="button" className="pin-mark" style={{ background: item.color || "#ffe56a" }} aria-label="Open sticky note" onClick={(event) => { event.stopPropagation(); onOpen(open === item.id ? "" : item.id); }} />
+          {open === item.id ? (
+            <span className="pin-pop" role="note">
+              {item.text}
+              <button type="button" aria-label="Remove sticky" onClick={() => onRemove(item.id)}>×</button>
+            </span>
+          ) : null}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function taskStickyNotes(task: BusinessTask): BoardNote[] {
+  const found: BoardNote[] = [];
+  for (const match of task.notes.matchAll(/\[\[sticky:([^|\]]+)\|([^\]]+)\]\]([^\n]*)/g)) {
+    found.push({ id: match[2], kind: "pin", text: match[3], when: "", color: match[1], pin: `task:${task.id}` });
+  }
+  return found;
+}
+
+function dropTarget(nodes: Element[]) {
+  for (const node of nodes) {
+    const el = node as HTMLElement;
+    if (el.closest?.(".is-dragging")) continue;
+    const task = el.closest?.("[data-task-id]") as HTMLElement | null;
+    if (task?.dataset.taskId) return `task:${task.dataset.taskId}`;
+    const todo = el.closest?.("[data-todo-id]") as HTMLElement | null;
+    if (todo?.dataset.todoId) return `todo:${todo.dataset.todoId}`;
+    const day = el.closest?.("[data-date]") as HTMLElement | null;
+    if (day?.dataset.date) return `date:${day.dataset.date}`;
+    const message = el.closest?.("[data-message-id]") as HTMLElement | null;
+    if (message?.dataset.messageId) return `message:${message.dataset.messageId}`;
+    const lot = el.closest?.("[data-lot-id]") as HTMLElement | null;
+    if (lot?.dataset.lotId) return `lot:${lot.dataset.lotId}`;
+    const board = el.closest?.("[data-board]") as HTMLElement | null;
+    if (board?.dataset.board) return `board:${board.dataset.board}`;
+  }
+  return "";
+}
+
+function hitTarget(x: number, y: number, ignore: Element | null) {
+  const nodes = document.elementsFromPoint(x, y).filter((node) => !ignore || (node !== ignore && !ignore.contains(node)));
+  return dropTarget(nodes);
+}
+
+function stickySpot(note: BoardNote, index: number) {
+  return {
+    x: typeof note.x === "number" ? note.x : (index % 4) * 176 + 12,
+    y: typeof note.y === "number" ? note.y : Math.floor(index / 4) * 140 + 12,
+  };
+}
+
+function MeetingBoard({ lots, onOpen, onSave, resident = false }: { lots: Lot[]; onOpen: (id: string) => void; onSave: (lot: Lot) => void; resident?: boolean }) {
+  const boardKey = resident ? HOA_BOARD_KEY : BOARD_KEY;
+  const [notes, setNotes] = useState<BoardNote[]>(() => (typeof window === "undefined" ? [] : loadBoard(boardKey)));
+  const [text, setText] = useState("");
+  const [stickyText, setStickyText] = useState("");
+  const [stickyColor, setStickyColor] = useState(STICKY_COLORS[4]);
+  const [messageColor, setMessageColor] = useState("#111");
+  const [colorOpen, setColorOpen] = useState(false);
+  const [messageColorOpen, setMessageColorOpen] = useState(false);
+  const composeDrag = useRef<{ dx: number; dy: number; x: number; y: number; w: number; sx: number; sy: number; live: boolean; startPin: string } | null>(null);
+  const [when, setWhen] = useState("");
+  const [ready, setReady] = useState(false);
+  const [biz, setBiz] = useState<BusinessTask[]>([]);
+  const [bills, setBills] = useState<ParkBill[]>([]);
+  const boardRef = useRef<HTMLDivElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const drag = useRef<{ id: string; dx: number; dy: number; x: number; y: number; homeX: number; homeY: number; startPin: string } | null>(null);
+  const [dragging, setDragging] = useState("");
+  const [dropHint, setDropHint] = useState("");
+  const [openPin, setOpenPin] = useState("");
+  const [messagesOpen, setMessagesOpen] = useState(false);
+  const [mapMode, setMapMode] = useState<"financial" | "main">("financial");
+  const [dragTick, setDragTick] = useState(0);
+  useEffect(() => {
+    if (resident) {
+      setReady(true);
+      return;
+    }
+    let active = true;
+    void readMaster()
+      .then((book) => {
+        if (!active) return;
+        const saved = Array.isArray(book?.board) ? (book.board as BoardNote[]) : [];
+        if (saved.length) {
+          setNotes((current) => {
+            const gone = loadDismissedStickies();
+            const map = new Map<string, BoardNote>();
+            for (const item of saved) if (item && typeof item.text === "string" && !gone.has(item.id)) map.set(item.id, item);
+            for (const item of current) if (item && typeof item.text === "string" && !gone.has(item.id)) map.set(item.id, item);
+            return [...map.values()];
+          });
+        }
+        if (Array.isArray(book?.bills)) setBills(book.bills.filter((item) => item && typeof (item as ParkBill).name === "string") as ParkBill[]);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) setReady(true);
+      });
+    void listBusinessTasks()
+      .then((rows) => {
+        if (active) setBiz(rows);
+      })
+      .catch(() => {});
+    try {
+      const local = JSON.parse(localStorage.getItem(BILLS_KEY) ?? "[]") as ParkBill[];
+      if (Array.isArray(local)) setBills(local.filter((item) => item && typeof item.name === "string"));
+    } catch {
+      /* the calendar still shows tasks */
+    }
+    return () => {
+      active = false;
+    };
+  }, [resident]);
+  useEffect(() => {
+    if (!ready) return;
+    try {
+      localStorage.setItem(boardKey, JSON.stringify(notes));
+    } catch {
+      /* the notes stay on screen */
+    }
+    if (resident) return;
+    const timer = window.setTimeout(() => {
+      void saveBoard({ data: { board: notes } }).catch(() => {});
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [notes, ready, resident, boardKey]);
+  useEffect(() => {
+    const root = frameRef.current;
+    if (!root) return;
+    const boxes = [...root.querySelectorAll<HTMLElement>("[data-resize]")];
+    for (const el of boxes) {
+      try {
+        const saved = JSON.parse(localStorage.getItem("magnolia-resize-" + el.dataset.resize) ?? "") as { w?: number; h?: number };
+        if (saved.w && el.dataset.resize !== "tasks" && el.dataset.resize !== "todo" && el.dataset.resize !== "calendar" && el.dataset.resize !== "finance" && el.dataset.resize !== "messages") el.style.width = `${saved.w}px`;
+        if (saved.h && el.dataset.resize !== "tasks" && el.dataset.resize !== "todo" && el.dataset.resize !== "calendar" && el.dataset.resize !== "finance") el.style.height = `${saved.h}px`;
+      } catch {
+        /* keep the starting size */
+      }
+    }
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const el = entry.target as HTMLElement;
+        const id = el.dataset.resize;
+        if (!id) continue;
+        localStorage.setItem("magnolia-resize-" + id, JSON.stringify({ w: Math.round(el.offsetWidth), h: Math.round(el.offsetHeight) }));
+      }
+    });
+    boxes.forEach((el) => observer.observe(el));
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    if (!ready || resident) return;
+    setNotes((current) => {
+      const gone = loadDismissedStickies();
+      const have = new Set(current.map((item) => item.id));
+      const extra: BoardNote[] = [];
+      for (const lot of lots) {
+        for (const sticky of lot.stickies ?? []) {
+          if (!have.has(sticky.id) && !gone.has(sticky.id)) extra.push({ id: sticky.id, kind: "pin", text: sticky.text, when: "", color: sticky.color, pin: `todo:${lot.id}` });
+        }
+      }
+      for (const task of biz) {
+        for (const sticky of taskStickyNotes(task)) {
+          if (!have.has(sticky.id) && !gone.has(sticky.id)) extra.push(sticky);
+        }
+      }
+      for (const [taskId, stickies] of Object.entries(loadTaskStickies())) {
+        for (const sticky of stickies) {
+          if (!have.has(sticky.id) && !gone.has(sticky.id)) extra.push({ id: sticky.id, kind: "pin", text: sticky.text, when: "", color: sticky.color, pin: `task:${taskId}` });
+        }
+      }
+      const kept = current.filter((item) => !gone.has(item.id));
+      return extra.length || kept.length !== current.length ? [...extra, ...kept] : current;
+    });
+  }, [lots, biz, ready]);
+  function add(kind: BoardNote["kind"]) {
+    const body = text.trim();
+    if (!body || (kind === "reminder" && !when)) return;
+    setNotes((current) => {
+      const stickiesNow = current.filter((item) => item.kind === "sticky").length;
+      return [{ id: `board-${Date.now()}`, kind, text: body, when: kind === "reminder" ? when : "", color: kind === "message" ? messageColor : STICKY_COLORS[current.length % STICKY_COLORS.length], x: kind === "sticky" ? 12 + (stickiesNow % 4) * 176 : undefined, y: kind === "sticky" ? 12 : undefined }, ...current];
+    });
+    setText("");
+    if (kind === "reminder") setWhen("");
+  }
+  function boardPoint(x: number, y: number) {
+    const host = frameRef.current?.querySelector<HTMLElement>("[data-board]");
+    const rect = host?.getBoundingClientRect();
+    return {
+      x: Math.max(8, Math.round(x - (rect?.left ?? 0) + (host?.scrollLeft ?? 0))),
+      y: Math.max(8, Math.round(y - (rect?.top ?? 0) + (host?.scrollTop ?? 0))),
+    };
+  }
+  function pinCompose(pin: string) {
+    const body = stickyText.trim();
+    if (!body) return;
+    const id = `pin-${Date.now()}`;
+    const target = pin.startsWith("lot:") ? `todo:${pin.slice(4)}` : pin;
+    setNotes((current) => [{ id, kind: "pin", text: body, when: "", color: stickyColor, pin: target }, ...current]);
+    try {
+      const saved = loadBoard(boardKey).filter((item) => item.id !== id);
+      localStorage.setItem(boardKey, JSON.stringify([{ id, kind: "pin", text: body, when: "", color: stickyColor, pin: target }, ...saved]));
+    } catch {
+      /* the next render writes the board again */
+    }
+    setStickyText("");
+    setOpenPin(id);
+    rememberPin(id, body, stickyColor, target);
+  }
+  function rememberPin(id: string, body: string, color: string, target: string) {
+    if (resident) return;
+    const lotId = target.startsWith("todo:") ? target.slice(5) : target.startsWith("task:lot-note:") ? target.slice("task:lot-note:".length) : "";
+    if (lotId) {
+      const lot = lots.find((item) => item.id === lotId);
+      if (lot) onSave({ ...lot, stickies: [...(lot.stickies ?? []), { id, text: body, color }] });
+    }
+    if (target.startsWith("task:")) {
+      const taskId = target.slice(5);
+      writeTaskSticky(taskId, { id, text: body, color });
+      const task = biz.find((item) => item.id === taskId);
+      if (task && !taskId.startsWith("lot-note:")) {
+        const notesText = `${task.notes ? `${task.notes}\n` : ""}[[sticky:${color}|${id}]]${body}`;
+        const next = { ...task, notes: notesText };
+        setBiz((current) => current.map((item) => (item.id === taskId ? next : item)));
+        void saveBusinessTask({ data: { task: next, action: "Updated" } })
+          .then((saved) => setBiz((current) => current.map((item) => (item.id === saved.id ? saved : item))))
+          .catch(() => {});
+      }
+    }
+  }
+  function forgetPin(id: string) {
+    setNotes((current) => current.filter((item) => item.id !== id));
+    eraseTaskSticky(id);
+    const lot = lots.find((item) => item.stickies?.some((sticky) => sticky.id === id));
+    if (lot) onSave({ ...lot, stickies: (lot.stickies ?? []).filter((sticky) => sticky.id !== id) });
+    const task = biz.find((item) => item.notes.includes(`|${id}]]`));
+    if (task) {
+      const notesText = task.notes.split("\n").filter((line) => !line.includes(`|${id}]]`)).join("\n").trim();
+      void saveBusinessTask({ data: { task: { ...task, notes: notesText }, action: "Updated" } })
+        .then((saved) => setBiz((current) => current.map((item) => (item.id === saved.id ? saved : item))))
+        .catch(() => {});
+    }
+  }
+  const todos = useMemo(() => buildTodo(lots), [lots]);
+  const business = useMemo(() => {
+    const saved = new Set(biz.map((task) => task.id));
+    return [...noteTasksFromLots(lots).filter((task) => !saved.has(task.id)), ...biz].filter((task) => task.status !== "Completed");
+  }, [biz, lots]);
+  const reminders = notes.filter((note) => note.kind === "reminder").sort((a, b) => a.when.localeCompare(b.when));
+  const stickies = notes.filter((note) => note.kind === "sticky");
+  const messages = notes.filter((note) => note.kind === "message");
+  const emergencies = resident ? messages.filter((note) => note.text.startsWith("EMERGENCY:")) : [];
+  const chat = resident ? messages.filter((note) => !note.text.startsWith("EMERGENCY:")) : messages;
+  return (
+    <div className="meeting-board" ref={frameRef}>
+      {resident && emergencies.length ? (
+        <section className="meeting-alert">
+          <h3>Emergency</h3>
+          <ul>
+            {emergencies.map((note) => (
+              <li key={note.id}>
+                <p>{note.text.replace(/^EMERGENCY:\s*/, "")}</p>
+                {note.when ? <time>{new Date(note.when).toLocaleString()}</time> : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      <div className="meeting-main">
+        <div className="meeting-tiles">
+          <section className={dropHint === "board:meeting" ? "meeting-tile bulletin-tile drop-ready" : "meeting-tile bulletin-tile"} data-board="meeting">
+            <h2>{resident ? "HOA Meeting Board" : "Meeting Board"}</h2>
+            <div className="meeting-compose">
+              <div
+                className={composeDrag.current?.live ? "compose-sticky-wrap is-dragging" : "compose-sticky-wrap"}
+                style={composeDrag.current?.live ? { background: stickyColor, position: "fixed", left: composeDrag.current.x, top: composeDrag.current.y, width: composeDrag.current.w, zIndex: 80 } : { background: stickyColor }}
+                onPointerDown={(event) => {
+                  const target = event.target as HTMLElement;
+                  if (target.closest("button") || !stickyText.trim()) return;
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  composeDrag.current = { dx: event.clientX - rect.left, dy: event.clientY - rect.top, x: rect.left, y: rect.top, w: rect.width, sx: event.clientX, sy: event.clientY, live: false, startPin: "" };
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                }}
+                onPointerMove={(event) => {
+                  const active = composeDrag.current;
+                  if (!active) return;
+                  if (!active.live) {
+                    if (Math.hypot(event.clientX - active.sx, event.clientY - active.sy) < 6) return;
+                    active.live = true;
+                    active.startPin = hitTarget(active.sx, active.sy, event.currentTarget);
+                    (event.currentTarget.querySelector("textarea") as HTMLTextAreaElement | null)?.blur();
+                  }
+                  active.x = event.clientX - active.dx;
+                  active.y = event.clientY - active.dy;
+                  const hint = hitTarget(event.clientX, event.clientY, event.currentTarget);
+                  setDropHint((current) => (current === hint ? current : hint));
+                  setDragTick((tick) => tick + 1);
+                }}
+                onPointerUp={(event) => {
+                  const active = composeDrag.current;
+                  if (!active) return;
+                  const pin = active.live ? hitTarget(event.clientX, event.clientY, event.currentTarget) : "";
+                  const moved = Math.hypot(event.clientX - active.sx, event.clientY - active.sy);
+                  const body = stickyText.trim();
+                  composeDrag.current = null;
+                  setDropHint("");
+                  setDragTick((tick) => tick + 1);
+                  if (!active.live) return;
+                  if (pin.startsWith("board:") && moved > 24 && body) {
+                    const spot = boardPoint(active.x, active.y);
+                    setNotes((current) => [{ id: `board-${Date.now()}`, kind: "sticky", text: body, when: "", color: stickyColor, pin: "board:meeting", x: spot.x, y: spot.y }, ...current]);
+                    setStickyText("");
+                    return;
+                  }
+                  if (pin && pin !== active.startPin) {
+                    pinCompose(pin);
+                    return;
+                  }
+                  if (moved > 24 && body) {
+                    setNotes((current) => [{ id: `board-${Date.now()}`, kind: "sticky", text: body, when: "", color: stickyColor, x: Math.round(active.x), y: Math.round(active.y) }, ...current]);
+                    setStickyText("");
+                  }
+                }}
+                onPointerCancel={() => {
+                  composeDrag.current = null;
+                  setDropHint("");
+                  setDragTick((tick) => tick + 1);
+                }}
+              >
+                <button type="button" className="sticky-color" style={{ background: stickyColor }} aria-label="Choose sticky color" aria-expanded={colorOpen} onMouseDown={(event) => event.preventDefault()} onClick={() => setColorOpen((open) => !open)} />
+                {colorOpen ? (
+                  <span className="sticky-colors">
+                    {STICKY_COLORS.map((color) => (
+                      <button key={color} type="button" style={{ background: color }} aria-label={`Sticky color ${color}`} onMouseDown={(event) => event.preventDefault()} onClick={() => { setStickyColor(color); setColorOpen(false); }} />
+                    ))}
+                  </span>
+                ) : null}
+                <textarea
+                  className="compose-sticky"
+                  rows={3}
+                  value={stickyText}
+                  placeholder="Sticky note"
+                  onChange={(event) => setStickyText(event.target.value)}
+                />
+              </div>
+            </div>
+            {stickies.filter((note) => note.pin === "board:meeting").map((note) => {
+              const live = drag.current?.id === note.id;
+              const spot = live ? { x: drag.current!.x, y: drag.current!.y } : { x: note.x ?? 24, y: note.y ?? 72 };
+              return (
+                <article
+                  key={note.id}
+                  className={dragging === note.id ? "sticky is-dragging" : "sticky"}
+                  style={{ background: note.color, position: live ? "fixed" : "absolute", left: spot.x, top: spot.y, zIndex: live ? 80 : 5 }}
+                  onPointerDown={(event) => {
+                    if ((event.target as HTMLElement).closest("button")) return;
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    drag.current = { id: note.id, dx: event.clientX - rect.left, dy: event.clientY - rect.top, x: rect.left, y: rect.top, homeX: rect.left, homeY: rect.top, startPin: "board:meeting" };
+                    setDragging(note.id);
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                  }}
+                  onPointerMove={(event) => {
+                    const active = drag.current;
+                    if (!active || active.id !== note.id) return;
+                    active.x = event.clientX - active.dx;
+                    active.y = event.clientY - active.dy;
+                    const hint = hitTarget(event.clientX, event.clientY, event.currentTarget);
+                    setDropHint((current) => (current === hint ? current : hint));
+                    setDragTick((tick) => tick + 1);
+                  }}
+                  onPointerUp={(event) => {
+                    const active = drag.current;
+                    if (!active || active.id !== note.id) return;
+                    const pin = hitTarget(event.clientX, event.clientY, event.currentTarget);
+                    const left = Math.round(active.x);
+                    const top = Math.round(active.y);
+                    drag.current = null;
+                    setDragging("");
+                    setDropHint("");
+                    if (pin.startsWith("board:") || !pin) {
+                      const spot = boardPoint(left, top);
+                      setNotes((current) => current.map((item) => (item.id === note.id ? { ...item, pin: "board:meeting", x: spot.x, y: spot.y } : item)));
+                      return;
+                    }
+                    const target = pin.startsWith("lot:") ? `todo:${pin.slice(4)}` : pin;
+                    rememberPin(note.id, note.text, note.color, target);
+                    setNotes((current) => current.map((item) => (item.id === note.id ? { ...item, kind: "pin", pin: target, x: undefined, y: undefined } : item)));
+                    setOpenPin(note.id);
+                  }}
+                  onPointerCancel={() => {
+                    if (drag.current?.id !== note.id) return;
+                    drag.current = null;
+                    setDragging("");
+                    setDropHint("");
+                  }}
+                >
+                  <button type="button" aria-label="Remove sticky" onClick={() => setNotes((current) => current.filter((item) => item.id !== note.id))}>×</button>
+                  <p>{note.text}</p>
+                </article>
+              );
+            })}
+          </section>
+          <div className="message-float meeting-tile" data-resize="messages">
+            <div className="message-head">
+              <h3>Message Board</h3>
+              {chat.length > 2 ? (
+                <button type="button" className="message-all" onClick={() => setMessagesOpen((open) => !open)}>{messagesOpen ? "Show latest" : "All messages"}</button>
+              ) : null}
+            </div>
+            {chat.length ? (
+              <ul className="meeting-messages">
+                {(messagesOpen ? chat : chat.slice(0, 2)).map((note, index) => (
+                  <li key={note.id} data-message-id={note.id} className={dropHint === `message:${note.id}` ? "drop-ready" : ""}>
+                    <p>{index === 0 ? <b>Latest</b> : index === 1 ? <b>Previous</b> : null} <span className="message-ink" style={{ color: messageInk(note.color) }}>{note.text}</span></p>
+                    <PinMarks notes={notes} pin={`message:${note.id}`} open={openPin} onOpen={setOpenPin} onRemove={forgetPin} />
+                    <button type="button" aria-label="Remove message" onClick={() => setNotes((current) => current.filter((item) => item.id !== note.id))}>×</button>
+                  </li>
+                ))}
+              </ul>
+            ) : <p className="message-empty">No messages yet.</p>}
+            <div className="message-compose">
+              <textarea
+                className="message-write"
+                rows={1}
+                value={text}
+                placeholder="Write a message"
+                style={{ color: messageInk(messageColor), fontWeight: 700 }}
+                onChange={(event) => setText(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    add("message");
+                  }
+                }}
+              />
+              <button type="button" className="sticky-color message-color" style={{ background: messageColor }} aria-label="Choose message color" aria-expanded={messageColorOpen} onMouseDown={(event) => event.preventDefault()} onClick={() => setMessageColorOpen((open) => !open)} />
+              {messageColorOpen ? (
+                <span className="sticky-colors message-colors">
+                  {["#111", ...STICKY_COLORS].map((color) => (
+                    <button key={color} type="button" style={{ background: color }} aria-label={`Message color ${color}`} onMouseDown={(event) => event.preventDefault()} onClick={() => { setMessageColor(color); setMessageColorOpen(false); }} />
+                  ))}
+                </span>
+              ) : null}
+            </div>
+          </div>
+        <section className="mini-list resize-box" data-resize="tasks">
+          {resident ? null : <>
+          <h3>Business tasks</h3>
+          {business.length === 0 ? <p>No open tasks.</p> : (
+            <ul>
+              {business.map((task) => {
+                const lotId = task.id.startsWith("lot-note:") ? task.id.slice("lot-note:".length) : "";
+                const fromLot = (lots.find((lot) => lot.id === lotId)?.stickies ?? []).map((sticky) => ({ id: sticky.id, kind: "pin" as const, text: sticky.text, when: "", color: sticky.color, pin: `task:${task.id}` }));
+                const fromSaved = (loadTaskStickies()[task.id] ?? []).filter((sticky) => !notes.some((item) => item.id === sticky.id)).map((sticky) => ({ id: sticky.id, kind: "pin" as const, text: sticky.text, when: "", color: sticky.color, pin: `task:${task.id}` }));
+                const pinned = [...notes, ...fromLot, ...fromSaved].filter((note) => note.kind === "pin" && note.pin === `task:${task.id}`);
+                const seen = new Set<string>();
+                const shown = pinned.filter((note) => {
+                  const key = note.text.trim().toLowerCase();
+                  if (seen.has(key)) return false;
+                  seen.add(key);
+                  return true;
+                });
+                return (
+                <li key={task.id} data-task-id={task.id} className={dropHint === `task:${task.id}` ? "drop-ready" : ""}>
+                  <b>{task.title}</b>
+                  <small>{task.category}{task.dueDate ? ` · ${task.dueDate}` : ""}</small>
+                  <PinMarks notes={shown} pin={`task:${task.id}`} open={openPin} onOpen={setOpenPin} onRemove={forgetPin} />
+                </li>
+                );
+              })}
+            </ul>
+          )}
+          </>}
+        </section>
+        {resident ? null : (
+        <section className="mini-list resize-box" data-resize="todo">
+          <h3>To-Do</h3>
+          {todos.length === 0 ? <p>Nothing open.</p> : (
+            <ul>
+              {todos.map((item) => (
+                <li key={item.id} data-todo-id={item.id} className={dropHint === `todo:${item.id}` ? "drop-ready" : ""}>
+                  <button type="button" onClick={() => onOpen(item.id)}>
+                    <b>Lot {item.lot}</b> {item.name || "—"}
+                    <small>{item.notes || item.text || "No notes"}</small>
+                  </button>
+                  <PinMarks
+                    notes={[
+                      ...notes.map((note) => (note.pin === `lot:${item.id}` ? { ...note, pin: `todo:${item.id}` } : note)),
+                      ...(lots.find((lot) => lot.id === item.id)?.stickies ?? [])
+                        .filter((sticky) => !notes.some((note) => note.id === sticky.id))
+                        .map((sticky) => ({ id: sticky.id, kind: "pin" as const, text: sticky.text, when: "", color: sticky.color, pin: `todo:${item.id}` })),
+                    ]}
+                    pin={`todo:${item.id}`}
+                    open={openPin}
+                    onOpen={setOpenPin}
+                    onRemove={forgetPin}
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+        )}
+        <section className="mini-calendar resize-box" data-resize="calendar">
+          <BusinessCalendar
+            mini
+            dropDate={dropHint.startsWith("date:") ? dropHint.slice(5) : ""}
+            pins={notes.filter((note) => note.kind === "pin" && note.pin?.startsWith("date:"))}
+            openPin={openPin}
+            onPin={setOpenPin}
+            bills={bills}
+            tasks={[
+              ...business,
+              ...reminders.map((note) => ({ id: note.id, title: note.text, category: "Other", dueDate: note.when, followUp: "", status: "Open", owner: "", cost: "", reference: "", notes: note.text })),
+            ]}
+          />
+        </section>
+        <section className="mini-finance resize-box" data-resize="finance">
+          {resident ? (
+            <>
+              <div className="mini-map-head"><h3>Map</h3></div>
+              <div className="mini-heat">
+                {([1, 2, 3] as const).map((id) => (
+                  <PlatMap key={id} sheet={id} query="" filter="all" selected={null} lots={lots} hideNames onlyNameId="" onSelect={() => {}} />
+                ))}
+              </div>
+            </>
+          ) : (
+          <>
+          <div className="mini-map-head">
+            <h3>{mapMode === "financial" ? "Financial" : "Main"}</h3>
+            <button type="button" className="mini-map-switch" onClick={() => setMapMode((mode) => (mode === "financial" ? "main" : "financial"))}>
+              {mapMode === "financial" ? "Main map" : "Financial"}
+            </button>
+          </div>
+          {mapMode === "financial" ? (
+            <HeatBoard lots={lots} scoped={lots} selected={null} onOpen={onOpen} mini dropLot={dropHint.startsWith("lot:") ? dropHint.slice(4) : ""} stickyIds={new Set([...notes.filter((note) => note.kind === "pin" && (note.pin?.startsWith("todo:") || note.pin?.startsWith("lot:"))).map((note) => note.pin!.slice(note.pin!.indexOf(":") + 1)), ...lots.filter((lot) => lot.stickies?.length).map((lot) => lot.id)])} />
+          ) : (
+            <div className="mini-heat">
+              {([1, 2, 3] as const).map((id) => (
+                <PlatMap key={id} sheet={id} query="" filter="all" selected={null} lots={lots} dropLot={dropHint.startsWith("lot:") ? dropHint.slice(4) : ""} stickyIds={new Set([...notes.filter((note) => note.kind === "pin" && (note.pin?.startsWith("todo:") || note.pin?.startsWith("lot:"))).map((note) => note.pin!.slice(note.pin!.indexOf(":") + 1)), ...lots.filter((lot) => lot.stickies?.length).map((lot) => lot.id)])} onSelect={onOpen} />
+              ))}
+            </div>
+          )}
+          </>
+          )}
+        </section>
+        </div>
+        {reminders.length ? (
+          <section>
+            <h3>Reminders</h3>
+            <ul className="meeting-reminders">
+              {reminders.map((note) => (
+                <li key={note.id} className={note.when < dayStamp() ? "is-due" : ""}>
+                  <time>{formatTodoDate(note.when)}</time>
+                  <p>{note.text}</p>
+                  <button type="button" aria-label="Remove reminder" onClick={() => setNotes((current) => current.filter((item) => item.id !== note.id))}>×</button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+      </div>
+      {stickies.filter((note) => note.pin !== "board:meeting").map((note) => {
+        const live = drag.current?.id === note.id;
+        const spot = live ? { x: drag.current!.x, y: drag.current!.y } : { x: note.x ?? 40, y: note.y ?? 80 };
+        return (
+          <article
+            key={note.id}
+            className={dragging === note.id ? "sticky is-dragging" : "sticky"}
+            style={{ background: note.color, position: "fixed", left: spot.x, top: spot.y, zIndex: live ? 80 : 30 }}
+            onPointerDown={(event) => {
+              if ((event.target as HTMLElement).closest("button")) return;
+              const rect = event.currentTarget.getBoundingClientRect();
+              drag.current = { id: note.id, dx: event.clientX - rect.left, dy: event.clientY - rect.top, x: rect.left, y: rect.top, homeX: rect.left, homeY: rect.top, startPin: hitTarget(event.clientX, event.clientY, event.currentTarget) };
+              setDragging(note.id);
+              event.currentTarget.setPointerCapture(event.pointerId);
+            }}
+            onPointerMove={(event) => {
+              const active = drag.current;
+              if (!active || active.id !== note.id) return;
+              active.x = event.clientX - active.dx;
+              active.y = event.clientY - active.dy;
+              const hint = hitTarget(event.clientX, event.clientY, event.currentTarget);
+              setDropHint((current) => (current === hint ? current : hint));
+              setDragTick((tick) => tick + 1);
+            }}
+            onPointerUp={(event) => {
+              const active = drag.current;
+              if (!active || active.id !== note.id) return;
+              const pin = hitTarget(event.clientX, event.clientY, event.currentTarget);
+              const left = Math.round(active.x);
+              const top = Math.round(active.y);
+              drag.current = null;
+              setDragging("");
+              setDropHint("");
+              if (pin.startsWith("board:")) {
+                const spot = boardPoint(left, top);
+                setNotes((current) => current.map((item) => (item.id === note.id ? { ...item, pin: "board:meeting", x: spot.x, y: spot.y } : item)));
+                return;
+              }
+              if (pin && pin !== active.startPin) {
+                const target = pin.startsWith("lot:") ? `todo:${pin.slice(4)}` : pin;
+                rememberPin(note.id, note.text, note.color, target);
+                setNotes((current) => current.map((item) => (item.id === note.id ? { ...item, kind: "pin", pin: target, x: undefined, y: undefined } : item)));
+                setOpenPin(note.id);
+                return;
+              }
+              setNotes((current) => current.map((item) => (item.id === note.id ? { ...item, x: left, y: top } : item)));
+            }}
+            onPointerCancel={() => {
+              if (drag.current?.id !== note.id) return;
+              drag.current = null;
+              setDragging("");
+              setDropHint("");
+            }}
+          >
+            <button type="button" aria-label="Remove sticky" onClick={() => setNotes((current) => current.filter((item) => item.id !== note.id))}>×</button>
+            <p>{note.text}</p>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
+const BILLS_KEY = "magnolia-park-bills";
+const BILL_ROWS = [
+  { id: "taxes", name: "Taxes" },
+  { id: "electric", name: "Electric" },
+  { id: "power", name: "Power" },
+  { id: "water", name: "Water" },
+  { id: "garbage", name: "Garbage" },
+  { id: "utilities", name: "Pay utilities" },
+  { id: "cards", name: "Credit cards" },
+  { id: "wiring", name: "Wiring insurance" },
+] as const;
+
+type ParkBill = { id: string; name: string; amount: string; due: string };
+
+function moneyNumber(value: string) {
+  const n = Number(String(value).replace(/[$,\s]/g, ""));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function billTone(days: number | null) {
+  if (days === null) return "";
+  if (days > 15) return "bill-green";
+  if (days > 0) return "bill-orange";
+  return "bill-red";
+}
+
+function billDueLabel(days: number | null) {
+  if (days === null) return "Set a due date";
+  if (days > 1) return `Due in ${days} days`;
+  if (days === 1) return "Due in 1 day";
+  if (days === 0) return "Due today";
+  return `${Math.abs(days)} days past due`;
+}
+
+function BillsBoard({ onChange, children }: { onChange?: (bills: ParkBill[]) => void; children?: ReactNode }) {
+  const [bills, setBills] = useState<ParkBill[]>(() => BILL_ROWS.map((row) => ({ ...row, amount: "", due: "" })));
+  const [ready, setReady] = useState(false);
+  const edited = useRef(false);
+
+  useEffect(() => {
+    let cancel = false;
+    void readMaster()
+      .then((book) => {
+        if (cancel || edited.current) return;
+        const saved = Array.isArray(book?.bills) ? (book.bills as Partial<ParkBill>[]) : null;
+        const local = (() => {
+          try {
+            return JSON.parse(localStorage.getItem(BILLS_KEY) ?? "[]") as Partial<ParkBill>[];
+          } catch {
+            return [];
+          }
+        })();
+        const source = saved?.some((item) => item.amount || item.due) ? saved : local;
+        if (source.length) {
+          setBills(
+            BILL_ROWS.map((row) => {
+              const found = source.find((item) => item.id === row.id);
+              return { ...row, amount: found?.amount ?? "", due: found?.due ?? "" };
+            }),
+          );
+        }
+      })
+      .catch(() => {
+        /* the blank rows stay editable */
+      })
+      .finally(() => {
+        if (!cancel) setReady(true);
+      });
+    return () => {
+      cancel = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    try {
+      localStorage.setItem(BILLS_KEY, JSON.stringify(bills));
+    } catch {
+      /* the numbers stay on screen */
+    }
+    const timer = window.setTimeout(() => {
+      onChange?.(bills);
+      void saveBills({ data: { bills } }).catch(() => {
+        /* the browser copy is still there */
+      });
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [bills, ready, onChange]);
+
+  function update(id: string, patch: Partial<ParkBill>) {
+    edited.current = true;
+    setBills((rows) => rows.map((row) => (row.id === id ? { ...row, ...patch } : row)));
+  }
+
+  return (
+    <div className="bills-board">
+      {children}
+      <h3 className="bills-title">Bills</h3>
+      <div className="bill-list">
+        {bills.map((bill) => {
+          const days = businessDays(bill.due);
+          const tone = billTone(days);
+          return (
+            <article className={"bill-row " + tone} key={bill.id}>
+              <h3>{bill.name}</h3>
+              <label>
+                Amount
+                <input
+                  inputMode="decimal"
+                  value={bill.amount}
+                  placeholder="0"
+                  onChange={(event) => update(bill.id, { amount: event.target.value })}
+                />
+              </label>
+              <label>
+                Due date
+                <input type="date" value={bill.due} onChange={(event) => update(bill.id, { due: event.target.value })} />
+              </label>
+              <p className={"bill-days " + tone}>{billDueLabel(days)}</p>
+            </article>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+type CalendarItem = { date: string; title: string; kind: "due" | "follow" | "bill" };
+
+function calendarStamp(date: Date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function calendarDays(cursor: Date) {
+  const first = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
+  const start = new Date(first);
+  start.setDate(1 - first.getDay());
+  return Array.from({ length: 42 }, (_, index) => {
+    const day = new Date(start);
+    day.setDate(start.getDate() + index);
+    return day;
+  });
+}
+
+function icsText(value: string) {
+  return value.replace(/\\/g, "\\\\").replace(/\r?\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
+}
+
+function nextDate(stamp: string) {
+  const day = new Date(stamp + "T00:00:00");
+  day.setDate(day.getDate() + 1);
+  return calendarStamp(day).replace(/-/g, "");
+}
+
+function BusinessCalendar({ tasks, bills, mini = false, dropDate = "", pins = [], openPin = "", onPin }: { tasks: BusinessTask[]; bills: ParkBill[]; mini?: boolean; dropDate?: string; pins?: BoardNote[]; openPin?: string; onPin?: (id: string) => void }) {
+  const [cursor, setCursor] = useState(() => new Date());
+  const [note, setNote] = useState("");
+  const items = useMemo(() => {
+    const rows: CalendarItem[] = [];
+    for (const task of tasks) {
+      if (task.status === "Completed") continue;
+      if (task.dueDate) rows.push({ date: task.dueDate, title: task.title || "Task due", kind: "due" });
+      if (task.followUp) rows.push({ date: task.followUp, title: `${task.title || "Task"} follow-up`, kind: "follow" });
+    }
+    for (const bill of bills) {
+      if (bill.due) rows.push({ date: bill.due, title: `${bill.name} bill`, kind: "bill" });
+    }
+    return rows;
+  }, [tasks, bills]);
+  const days = calendarDays(cursor);
+  const today = calendarStamp(new Date());
+  const monthLabel = cursor.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+
+  function syncGoogle() {
+    const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Magnolia Estates//Business Center//EN", "CALSCALE:GREGORIAN", "METHOD:PUBLISH"];
+    items.forEach((item, index) => {
+      const start = item.date.replace(/-/g, "");
+      lines.push("BEGIN:VEVENT", `UID:magnolia-${item.kind}-${start}-${index}@magnolia`, `DTSTART;VALUE=DATE:${start}`, `DTEND;VALUE=DATE:${nextDate(item.date)}`, `SUMMARY:${icsText(item.title)}`, "END:VEVENT");
+    });
+    lines.push("END:VCALENDAR");
+    const url = URL.createObjectURL(new Blob([lines.join("\r\n")], { type: "text/calendar" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "magnolia-business.ics";
+    link.click();
+    URL.revokeObjectURL(url);
+    window.open("https://calendar.google.com/calendar/u/0/r/settings/export", "_blank", "noopener,noreferrer");
+    setNote(items.length ? `Downloaded ${items.length} date${items.length === 1 ? "" : "s"}. In the Google Calendar tab, choose Import and pick magnolia-business.ics.` : "Add a due date first, then sync.");
+  }
+
+  return (
+    <section className={mini ? "park-calendar is-mini" : "park-calendar"}>
+      <div className="park-calendar-head">
+        <div>
+          {mini ? null : <p className="eyebrow">CALENDAR</p>}
+          <h3>{monthLabel}</h3>
+        </div>
+        <div className="park-calendar-actions">
+          <button type="button" className="business-secondary" onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1))} aria-label="Previous month">‹</button>
+          <button type="button" className="business-secondary" onClick={() => setCursor(new Date())}>Today</button>
+          <button type="button" className="business-secondary" onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1))} aria-label="Next month">›</button>
+          {mini ? null : <button type="button" className="business-primary" onClick={syncGoogle}>Sync Google Calendar</button>}
+        </div>
+      </div>
+      {note ? <p className="park-calendar-note">{note}</p> : null}
+      <div className="park-calendar-week">{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => <span key={day}>{day}</span>)}</div>
+      <div className="park-calendar-grid">
+        {days.map((day) => {
+          const stamp = calendarStamp(day);
+          const here = items.filter((item) => item.date === stamp);
+          const outside = day.getMonth() !== cursor.getMonth();
+          return (
+            <div data-date={stamp} className={"park-day" + (outside ? " is-outside" : "") + (stamp === today ? " is-today" : "") + (dropDate === stamp ? " drop-ready" : "")} key={stamp + (outside ? "-x" : "")}>
+              <strong>{day.getDate()}</strong>
+              {pins.filter((note) => note.pin === `date:${stamp}`).map((note) => (
+                <span className="pin-wrap" key={note.id}>
+                  <button type="button" className="pin-mark" style={{ background: note.color || "#ffe56a" }} aria-label="Open sticky note" onClick={() => onPin?.(openPin === note.id ? "" : note.id)} />
+                  {openPin === note.id ? <span className="pin-pop" role="note">{note.text}</span> : null}
+                </span>
+              ))}
+              {here.slice(0, mini ? 1 : 3).map((item) => <em className={"cal-" + item.kind} key={item.kind + item.title}>{item.title}</em>)}
+              {here.length > (mini ? 1 : 3) ? <em className="cal-more">+{here.length - (mini ? 1 : 3)}</em> : null}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function Home() {
+  const uploadRef = useRef<HTMLInputElement>(null);
+  const backupRef = useRef<HTMLInputElement>(null);
+  const quickBooksRef = useRef<HTMLInputElement>(null);
+  const [sheet, setSheet] = useState<SheetId>(1);
+  const [main, setMain] = useState(true);
+  const [walkAll, setWalkAll] = useState(false);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<LotFilter[]>([]);
+  const [selected, setSelected] = useState<string | null>("1");
+  const [view, setView] = useState<"map" | "register" | "todo" | "mow" | "increase" | "alert" | "heat" | "business" | "meeting" | "home" | "plant" | "inventory" | "handyman" | "vendors" | "audit" | "hoa" | "mgrtodo">(() => {
+    if (typeof window === "undefined") return "map";
+    return new URLSearchParams(window.location.search).get("view") === "heat" ? "heat" : "map";
+  });
+  const [session, setSession] = useState<Session | null>(() => loadSession());
+  const residentId = session?.role === "resident" ? session.lotId : null;
+  const vendorId = session?.role === "vendor" ? session.vendorId : null;
+  const maintenance = session?.role === "maintenance";
+  const manager = session?.role === "manager";
+  const managerName = session?.role === "manager" ? session.user : "";
+  const landlordName = session?.role === "landlord" ? session.user : "";
+  useEffect(() => {
+    setAuditUser(landlordName || managerName || (residentId ? "Resident" : vendorId ? "Vendor" : maintenance ? "Maintenance" : ""));
+  }, [landlordName, managerName, residentId, vendorId, maintenance]);
+  useEffect(() => {
+    if (!manager) return;
+    if (view === "home" || view === "meeting" || view === "todo" || view === "business" || view === "heat" || view === "register" || view === "audit" || view === "increase" || view === "alert" || view === "hoa") setView("map");
+  }, [manager, view]);
+  const [registerMode, setRegisterMode] = useState<"short" | "full" | "homes">("short");
+  const [matchAt, setMatchAt] = useState(0);
+  const [legendOn, setLegendOn] = useState(() => typeof window === "undefined" || window.matchMedia("(min-width: 901px)").matches);
+  const [symbols, setSymbols] = useState(false);
+  const [dark, setDark] = useState(() => typeof window !== "undefined" && localStorage.getItem("magnolia-theme") === "dark");
+  useEffect(() => {
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    document.documentElement.style.colorScheme = dark ? "dark" : "light";
+  }, [dark]);
+  const [logoSrc, setLogoSrc] = useState(() => (typeof window === "undefined" ? "/logo.jpg" : localStorage.getItem("magnolia-logo") || "/logo.jpg"));
+  const logoRef = useRef<HTMLInputElement>(null);
+  const [device, setDevice] = useState<keyof typeof DEVICE_LINKS | null>(null);
+  const [deviceUrl, setDeviceUrl] = useState("");
+  const [alarmOn, setAlarmOn] = useState(false);
+  const [mapsOpen, setMapsOpen] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [dataOpen, setDataOpen] = useState(false);
+  const [maintTab, setMaintTab] = useState<"work" | "inventory">("work");
+  const [versions, setVersions] = useState<{ id: string; saved: string; count: number }[] | null>(null);
+  const [qbNote, setQbNote] = useState("");
+  const [syncState, setSyncState] = useState<SyncState>("local");
+
+  const [lots, setLots] = useState<Lot[]>([]);
+  const [hydrated, setHydrated] = useState(false);
+  const hydratedRef = useRef(false);
+  const dirtyRef = useRef(false);
+  const masterReady = useRef(false);
+  const mapReady = useRef(false);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const tag = (event.target as HTMLElement | null)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      const jump: Record<string, typeof view> = manager
+        ? { m: "map", t: "mgrtodo", w: "mow", p: "plant" }
+        : { h: "home", m: "map", t: "todo", w: "mow", f: "heat", b: "business", g: "meeting", r: "register", p: "plant", i: "inventory" };
+      if (event.key === "?" || (event.shiftKey && event.key === "/")) {
+        window.alert("Shortcuts: H Home, M Map, T To-Do, W Mow, F Financial, B Business, G Meeting, R Register, P Treatment Plant, I Inventory, J/K step lots, Enter open, Escape close.");
+        return;
+      }
+      const next = jump[event.key.toLowerCase()];
+      if (next) setView(next);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [manager]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    try {
+      localStorage.setItem("magnolia-theme", dark ? "dark" : "light");
+    } catch {
+      /* the toggle still flips this session */
+    }
+  }, [dark]);
+
+  useEffect(() => {
+    const onAlarm = (event: Event) => {
+      const on = (event as CustomEvent<{ on?: boolean }>).detail?.on;
+      if (typeof on === "boolean") setAlarmOn(on);
+    };
+    window.addEventListener("magnolia-alarm", onAlarm);
+    return () => window.removeEventListener("magnolia-alarm", onAlarm);
+  }, []);
+
+  useEffect(() => {
+    mapReady.current = true;
+    try {
+      setDeviceUrl(localStorage.getItem(CAMERA_KEY) ?? "");
+      setAlarmOn(localStorage.getItem(ALARM_ON_KEY) === "Yes");
+    } catch {
+      /* the camera link can be typed in */
+    }
+  }, []);
+
+  function openDevice(kind: keyof typeof DEVICE_LINKS) {
+    let stored = "";
+    try {
+      stored = localStorage.getItem(DEVICE_LINKS[kind].key) ?? "";
+    } catch {
+      stored = "";
+    }
+    setDeviceUrl(stored);
+    setDevice(kind);
+  }
+
+  useEffect(() => {
+    if (!mapReady.current) return;
+    localStorage.setItem(MAP_KEY, JSON.stringify({ main, sheet }));
+  }, [main, sheet]);
+
+  useEffect(() => {
+    let cancel = false;
+    void (async () => {
+      const local = loadLots();
+      let next = local;
+      try {
+        const master = await readMaster();
+        let localAt = "";
+        try {
+          localAt = localStorage.getItem(STORAGE_AT) ?? "";
+        } catch {
+          localAt = "";
+        }
+        const masterStore = (master as { store?: Record<string, string>; force?: boolean } | null)?.store;
+        const forced = Boolean((master as { force?: boolean } | null)?.force);
+        if (master?.lots?.length && !forced && localAt && master.saved && localAt > master.saved) {
+          const byId = new Map((master.lots as Lot[]).map((lot) => [lot.id, lot]));
+          const blank = (value: unknown) => value == null || value === "" || (Array.isArray(value) && value.length === 0);
+          next = local.map((lot) => {
+            const prev = (byId.get(lot.id) ?? {}) as Lot;
+            const merged = { ...prev, ...lot, id: lot.id } as Lot;
+            for (const key of Object.keys(prev) as (keyof Lot)[]) {
+              if (blank(merged[key]) && !blank(prev[key])) merged[key] = prev[key];
+            }
+            if (!lot.name.trim() && prev.name?.trim()) {
+              merged.name = prev.name;
+              if (lot.status === "Empty" && prev.status && prev.status !== "Empty") merged.status = prev.status;
+            }
+            return withEmptyMow(merged);
+          });
+        } else if (master?.lots?.length) {
+          if (masterStore) restoreStore(masterStore);
+          next = (master.lots as Lot[]).map((lot) => withEmptyMow(lot));
+        } else await pushMaster(local);
+      } catch {
+        /* open the browser copy if the master file cannot be read */
+      }
+      if (cancel) return;
+      setLots(next);
+      rememberLots(next);
+      masterReady.current = true;
+      hydratedRef.current = true;
+      setHydrated(true);
+      try {
+        const note = localStorage.getItem("magnolia-boot-note");
+        if (note) {
+          localStorage.removeItem("magnolia-boot-note");
+          setQbNote(note);
+        }
+      } catch {
+        /* the register is already on screen */
+      }
+    })();
+    return () => {
+      cancel = true;
+    };
+  }, []);
+
+  const lotsRef = useRef(lots);
+  lotsRef.current = lots;
+
+  useEffect(() => {
+    if (!hydrated || !masterReady.current) return;
+    const id = window.setTimeout(() => {
+      rememberLots(lotsRef.current);
+      queueMaster(lotsRef.current);
+    }, 300);
+    return () => window.clearTimeout(id);
+  }, [lots, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated || !masterReady.current) return;
+    const flush = () => {
+      void pushMaster(lotsRef.current);
+    };
+    const beat = window.setInterval(flush, 20000);
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("online", flush);
+    return () => {
+      window.clearInterval(beat);
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("online", flush);
+    };
+  }, [hydrated]);
+
+  useEffect(() => {
+    const listen = (state: SyncState) => setSyncState(state);
+    syncListeners.add(listen);
+    if (import.meta.env.PROD && "serviceWorker" in navigator) {
+      void navigator.serviceWorker.register("/magnolia-offline.js").catch(() => {});
+    }
+    return () => {
+      syncListeners.delete(listen);
+    };
+  }, []);
+
+  function syncNow() {
+    setDataOpen(false);
+    void pushMaster(lotsRef.current).then((ok) => {
+      setQbNote(ok ? "Synced. This copy is on the office computer." : "Saved on this device. The office computer is not reachable. Download everything to take this copy with you.");
+    });
+  }
+
+  function saveLot(next: Lot) {
+    const prevLot = lotsRef.current.find((item) => item.id === next.id);
+    const parkRate = lotsRef.current.find((item) => !isOutsideLot(item) && item.status === "Occupied" && (item.lotRent ?? "").trim())?.lotRent?.trim() || "540";
+    const draft = !isOutsideLot(next) && next.status === "Occupied" && !(next.lotRent ?? "").trim() ? { ...next, lotRent: parkRate } : next;
+    const lotRentChanged = Boolean(prevLot && (prevLot.lotRent ?? "").trim() && draft.status === "Occupied" && (prevLot.lotRent ?? "") !== (draft.lotRent ?? ""));
+    const totalOnly = Boolean(prevLot && prevLot.rent !== draft.rent && (prevLot.homeRent ?? "") === (draft.homeRent ?? "") && !lotRentChanged);
+    const edited = withEmptyMow(totalOnly ? { ...draft, homeRent: rentGap(draft.rent, draft.lotRent ?? "", petFee(draft.dogs, draft.cats)) } : draft);
+    const detail = lotChangeText(prevLot, edited);
+    if (detail) logAudit("Register", detail, edited.lot);
+    dirtyRef.current = true;
+    setLots((prev) => {
+      const nextLots = prev.map((item) => {
+        if (lotRentChanged && item.status === "Occupied" && !isOutsideLot(item)) return withEmptyMow({ ...item, ...(item.id === edited.id ? edited : {}), lotRent: edited.lotRent ?? "" });
+        return item.id === edited.id ? edited : item;
+      });
+      lotsRef.current = nextLots;
+      if (hydratedRef.current) {
+        rememberLots(nextLots);
+        queueMaster(nextLots);
+      }
+      return nextLots;
+    });
+  }
+
+  const visible = useMemo(() => {
+    return lots.filter((lot) => (filter.length === 0 || filter.some((item) => matchesFilter(lot, item))) && matches(lot, query));
+  }, [lots, filter, query]);
+
+  const sig = `${filter.join(",")}|${query}`;
+  const prevSig = useRef(sig);
+
+  useEffect(() => {
+    if (prevSig.current === sig) return;
+    prevSig.current = sig;
+    if (!query.trim() && filter.length === 0) return;
+    if (visible.length === 0) return;
+    setMatchAt(0);
+    const target = visible[0];
+    setSelected(target.id);
+    const next = sheetOf(target.id);
+    if (next) {
+      setSheet(next);
+      setView("map");
+      setMain(false);
+    } else {
+      setView("register");
+      setRegisterMode((mode) => (mode === "homes" ? "short" : mode));
+    }
+  }, [sig, query, filter, visible]);
+
+  function choose(id: string) {
+    if (vendorId) return;
+    if (residentId && id !== residentId) return;
+    setSelected(id);
+    const index = visible.findIndex((item) => item.id === id);
+    if (index >= 0) setMatchAt(index);
+  }
+
+  useEffect(() => {
+    if (!residentId) return;
+    setView("map");
+    setMain(true);
+    setFilter([]);
+    setQuery("");
+    setMapsOpen(false);
+    setSelected(residentId);
+  }, [residentId]);
+
+  useEffect(() => {
+    if (!vendorId) return;
+    setView("map");
+    setMain(true);
+    setFilter([]);
+    setQuery("");
+    setMapsOpen(false);
+  }, [vendorId]);
+
+  function queueManagerEdit(next: Lot) {
+    const base = lotsRef.current.find((item) => item.id === next.id);
+    if (!base) return;
+    const skip = new Set(["id", "managerRequest", "residentRequest", "rent", "lotRent", "homeRent", "rentInc2026", "rentInc2027", "deposit", "balance", "rentDue"]);
+    const patch: Partial<Lot> = {};
+    for (const key of Object.keys(next) as (keyof Lot)[]) {
+      if (skip.has(key)) continue;
+      if (JSON.stringify(base[key] ?? "") !== JSON.stringify(next[key] ?? "")) patch[key] = next[key] as never;
+    }
+    saveLot({ ...base, managerRequest: Object.keys(patch).length ? { at: new Date().toISOString(), patch } : null });
+  }
+
+  function openLot(id: string) {
+    choose(id);
+    const next = sheetOf(id);
+    if (next) {
+      setSheet(next);
+      setMain(false);
+    }
+  }
+
+  function stepLot(dir: -1 | 1) {
+    const ordered = [...lots].sort((a, b) => Number(a.lot) - Number(b.lot) || a.lot.localeCompare(b.lot));
+    const sequence = main || walkAll ? ordered : ordered.filter((item) => sheetOf(item.id) === sheet);
+    if (!sequence.length) return;
+    const index = sequence.findIndex((item) => item.id === selected);
+    const nextIndex = index < 0 ? (dir > 0 ? 0 : sequence.length - 1) : (index + dir + sequence.length) % sequence.length;
+    const target = sequence[nextIndex];
+    setSelected(target.id);
+    const at = visible.findIndex((item) => item.id === target.id);
+    if (at >= 0) setMatchAt(at);
+    const nextSheet = sheetOf(target.id);
+    if (!nextSheet) return;
+    setSheet(nextSheet);
+    if (main) {
+      setWalkAll(true);
+      setMain(false);
+    }
+  }
+
+  function showMatch(index: number) {
+    if (visible.length === 0) return;
+    const at = ((index % visible.length) + visible.length) % visible.length;
+    setMatchAt(at);
+    const target = visible[at];
+    setSelected(target.id);
+    const next = sheetOf(target.id);
+    if (next) {
+      setSheet(next);
+      setView("map");
+      setMain(false);
+    } else setView("register");
+  }
+
+  const visibleIds = useMemo(() => new Set(visible.map((lot) => lot.id)), [visible]);
+  const lot = lots.find((item) => item.id === selected) ?? null;
+  const mapLabel = main ? "Main" : SHEET_COPY[sheet].title;
+  const filterGroups = (
+    [
+      ["Status", [
+        ["empty", "Empty"],
+        ["occupied", "Occupied"],
+        ["renters", "Renters"],
+        ["owners", "Owners"],
+      ]],
+      ["Property", [
+        ["issues", "Issues"],
+        ["due", "Rent due"],
+        ["past-due", "Past due"],
+        ["roof", "Needs roof"],
+        ["pets", "Pets"],
+        ["wiring", "Wiring"],
+        ["no-owe", "Owe-Mow"],
+        ["lease-ending", "Lease ending"],
+      ]],
+    ] as const
+  );
+  const filterNames = filterGroups.flatMap(([, items]) => items);
+  const filterLabel = filter.length === 0 ? "" : filter.length === 1 ? filterNames.find(([id]) => id === filter[0])?.[1] ?? "" : `${filter.length} on`;
+  const narrowed = query.trim() !== "" || filter.length > 0;
+
+  useEffect(() => {
+    if (!mapsOpen && !filtersOpen && !dataOpen) return;
+    const close = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest(".map-slot")) return;
+      setMapsOpen(false);
+      setFiltersOpen(false);
+      setDataOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMapsOpen(false);
+        setFiltersOpen(false);
+        setDataOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [mapsOpen, filtersOpen, dataOpen]);
+
+  if (!session) {
+    return (
+      <main className="app login-app" data-theme={dark ? "dark" : "light"}>
+        <LoginScreen lots={lots} onEnter={(next) => { saveSession(next); setSession(next); setView(next.role === "maintenance" ? "handyman" : "map"); }} />
+      </main>
+    );
+  }
+
+  return (
+    <main className="app" data-theme={dark ? "dark" : "light"} data-role={session?.role ?? "signed-out"}>
+      <svg className="icon-defs" width="0" height="0" aria-hidden="true">
+        <defs>
+          <pattern id="maintStripes" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <rect width="8" height="8" fill="#fff200" />
+            <line x1="0" y1="0" x2="0" y2="8" stroke="#000" strokeWidth="2" />
+          </pattern>
+          <pattern id="roofStripes" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <rect width="8" height="8" fill="#2f6bff" />
+            <line x1="0" y1="0" x2="0" y2="8" stroke="#fff" strokeWidth="2" />
+          </pattern>
+        </defs>
+      </svg>
+      {device ? (
+        <form
+          className="camera-panel"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const url = deviceUrl.trim();
+            const key = DEVICE_LINKS[device].key;
+            try {
+              localStorage.setItem(key, url);
+            } catch {
+              /* the link still opens this time */
+            }
+            if (url) window.open(url, "_blank", "noopener,noreferrer");
+          }}
+        >
+          <h2>{DEVICE_LINKS[device].title}</h2>
+          <label>
+            {DEVICE_LINKS[device].label}
+            <input
+              autoFocus
+              value={deviceUrl}
+              placeholder={DEVICE_LINKS[device].placeholder}
+              onChange={(e) => {
+                setDeviceUrl(e.target.value);
+                try {
+                  localStorage.setItem(DEVICE_LINKS[device].key, e.target.value);
+                } catch {
+                  /* typed link is kept on screen */
+                }
+              }}
+            />
+          </label>
+          {device === "alarm" ? (
+            <div className="alarm-switch" role="group" aria-label="Alarm">
+              <button
+                type="button"
+                aria-pressed={alarmOn}
+                onClick={() => {
+                  setAlarmOn(true);
+                  try {
+                    localStorage.setItem(ALARM_ON_KEY, "Yes");
+                  } catch {
+                    /* the light still follows the switch */
+                  }
+                }}
+              >
+                On
+              </button>
+              <button
+                type="button"
+                aria-pressed={!alarmOn}
+                onClick={() => {
+                  setAlarmOn(false);
+                  try {
+                    localStorage.setItem(ALARM_ON_KEY, "No");
+                  } catch {
+                    /* the light still follows the switch */
+                  }
+                }}
+              >
+                Off
+              </button>
+            </div>
+          ) : null}
+          <div className="camera-actions">
+            <button className="filter" type="submit">
+              Open
+            </button>
+            <button className="filter" type="button" onClick={() => setDevice(null)}>
+              Close
+            </button>
+          </div>
+        </form>
+      ) : null}
+      <header className="top">
+        <div className="top-tools">
+          {residentId || vendorId ? null : (
+          <input
+            className="search"
+            value={query}
+            placeholder="Lot, name, or address"
+            aria-label="Search lots"
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          )}
+          <h1 className="brand-mark">
+            <button type="button" className="logo-upload" aria-label="Upload logo" onClick={() => logoRef.current?.click()}>
+              <img src={logoSrc} alt="" />
+            </button>
+            <span>Magnolia Estates</span>
+          </h1>
+          <input
+            ref={logoRef}
+            className="logo-file"
+            type="file"
+            accept="image/*"
+            hidden
+            onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = () => {
+                  const data = String(reader.result ?? "");
+                  if (!data) return;
+                  setLogoSrc(data);
+                  try { localStorage.setItem("magnolia-logo", data); } catch { /* keep the new logo for this session */ }
+                };
+                reader.readAsDataURL(file);
+                event.target.value = "";
+              }}
+            />
+        </div>
+      </header>
+      <div className="toolbar">
+        {residentId ? (
+          <div className="tabs" role="tablist" aria-label="Resident">
+            <button className="tab" type="button" aria-pressed={view === "map"} onClick={() => { setView("map"); setMain(true); }}>Map</button>
+            <button className="tab" type="button" aria-pressed={view === "map" && selected === residentId} onClick={() => { setView("map"); setMain(true); setSelected(residentId); }}>My home</button>
+            <button className="tab" type="button" aria-pressed={view === "meeting"} onClick={() => setView("meeting")}>Messages</button>
+            <button className="tab" type="button" aria-pressed={view === "hoa"} onClick={() => setView("hoa")}>HOA</button>
+            <button className="tab tab-end" type="button" onClick={() => { saveSession(null); setSession(null); }}>Sign out</button>
+          </div>
+        ) : vendorId ? (
+          <div className="tabs" role="tablist" aria-label="Vendor">
+            <button className="tab" type="button" aria-pressed={view === "map"} onClick={() => { setView("map"); setMain(true); }}>Map</button>
+            <button className="tab" type="button" aria-pressed={view === "vendors"} onClick={() => setView("vendors")}>Documents</button>
+            <button className="tab tab-end" type="button" onClick={() => { saveSession(null); setSession(null); }}>Sign out</button>
+          </div>
+        ) : maintenance ? (
+          <div className="tabs" role="tablist" aria-label="Maintenance">
+            <button className="tab" type="button" aria-pressed={view === "map"} onClick={() => { setView("map"); setMain(true); }}>Map</button>
+            <button className="tab" type="button" aria-pressed={view === "handyman"} onClick={() => setView("handyman")}>Maintenance</button>
+            <button className="tab tab-end" type="button" onClick={() => { saveSession(null); setSession(null); }}>Sign out</button>
+          </div>
+        ) : (
+        <>
+        <div className="map-attach">
+          <div className="map-slot">
+            <div className="map-tab" role="group" aria-label="Maps">
+              <button
+                className="tab map-tab-go"
+                type="button"
+                role="tab"
+                aria-pressed={view === "map"}
+                onClick={() => {
+                  setView("map");
+                  setMapsOpen(false);
+                  setFiltersOpen(false);
+                }}
+              >
+                Maps · {mapLabel}
+              </button>
+              <button
+                className="tab map-tab-menu"
+                type="button"
+                aria-expanded={mapsOpen}
+                aria-label="Choose a map"
+                aria-pressed={view === "map"}
+                onClick={() => {
+                  setFiltersOpen(false);
+                  setMapsOpen((open) => !open);
+                }}
+              >
+                ▾
+              </button>
+            </div>
+            {mapsOpen ? (
+              <div className="map-drop map-drop-split" role="menu">
+                <div className="map-drop-maps">
+                {(
+                  [
+                    ["main", "Main"],
+                    ["1", "Jaleen/Denise"],
+                    ["2", "Denise/Leon"],
+                    ["3", "Michelle/Kirkwood"],
+                  ] as const
+                ).map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={id === "main" ? main : !main && String(sheet) === id}
+                    onClick={() => {
+                      setView("map");
+                      setWalkAll(false);
+                      if (id === "main") setMain(true);
+                      else {
+                        setMain(false);
+                        setSheet(Number(id) as SheetId);
+                      }
+                      setMapsOpen(false);
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+                </div>
+                <div className="map-drop-filters filter-checks" role="group" aria-label="Map filters">
+                  {filterGroups.map(([group, items]) => (
+                    <div key={group} className="filter-group">
+                      <p>{group}</p>
+                      {items.filter(([id]) => !manager || (id !== "due" && id !== "past-due" && id !== "lease-ending" && id !== "no-owe")).map(([id, label]) => (
+                        <label key={id}>
+                          <input
+                            type="checkbox"
+                            checked={filter.includes(id)}
+                            onChange={() => {
+                              setFilter((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+                              setView("map");
+                            }}
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+          </div>
+          <div className="tabs" role="tablist" aria-label="Sections">
+          {session?.role === "manager" ? (
+            <>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "mgrtodo"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("mgrtodo"); }}>To-Do</button>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "mow"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("mow"); }}>Mow</button>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "handyman"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("handyman"); }}>Maintenance</button>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "plant"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("plant"); }}>Treatment Plant</button>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "vendors"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("vendors"); }}>Vendors</button>
+            </>
+          ) : (
+            <>
+              {(
+                [
+                  ["home", "Home"],
+                  ["meeting", "Meeting"],
+                  ["todo", "To-Do"],
+                  ["mow", "Mow"],
+                  ["business", "Business"],
+                  ["heat", "Financial"],
+                  ["handyman", "Maintenance"],
+                  ["plant", "Treatment Plant"],
+                  ["vendors", "Vendors"],
+                ] as const
+              ).map(([id, label]) => (
+                <button key={id} className="tab" type="button" role="tab" data-view={id} aria-pressed={view === id} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView(id); }}>
+                  {label}
+                </button>
+              ))}
+              <button className="tab tab-end" type="button" role="tab" data-view="register" aria-pressed={view === "register"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("register"); }}>
+                Register
+              </button>
+            </>
+          )}
+          <button className="theme-toggle" type="button" aria-pressed={dark} onClick={() => setDark((on) => !on)}>
+            {dark ? "Light" : "Dark"}
+          </button>
+          <button className="tab" type="button" onClick={() => { saveSession(null); setSession(null); }}>
+            {landlordName || managerName ? `${landlordName || managerName} · Sign out` : "Sign out"}
+          </button>
+        </div>
+        </>
+        )}
+        {narrowed && !residentId && !vendorId ? (
+          <div className="active-strip">
+            <span>
+              Showing {visible.length} of {lots.length}
+              {filter.length ? ` · ${filterLabel}` : ""}
+              {query.trim() ? ` · “${query.trim()}”` : ""}
+            </span>
+            {visible.length > 1 ? (
+              <span className="match-nav">
+                <button type="button" aria-label="Previous match" onClick={() => showMatch(matchAt - 1)}>
+                  ‹
+                </button>
+                <span>
+                  {Math.min(matchAt, visible.length - 1) + 1} of {visible.length}
+                </span>
+                <button type="button" aria-label="Next match" onClick={() => showMatch(matchAt + 1)}>
+                  ›
+                </button>
+              </span>
+            ) : null}
+            <button
+              className="strip-clear"
+              type="button"
+              onClick={() => {
+                setFilter([]);
+                setQuery("");
+              }}
+            >
+              Clear
+            </button>
+          </div>
+        ) : null}
+        {view === "map" && !residentId && !vendorId && (legendOn || symbols) ? (
+          <div className={legendOn ? "legend legend-bar" : "legend legend-bar is-collapsed"}>
+            {legendOn ? (
+              <>
+                <span><i className="swatch" /> Occupied</span>
+                <span><i className="swatch empty" /> Empty</span>
+                <span><i className="swatch open" /> Office</span>
+                <span><i className="swatch notes" /> Issues</span>
+                <span><i className="swatch mow-flag" aria-hidden="true" /> Mow</span>
+                <span><i className="swatch late" /> Late</span>
+                <span><i className="swatch leak" /> Leak</span>
+                <span><i className="swatch roof" /> Roof</span>
+                <span><i className="swatch maint" /> Maint</span>
+                <span><i className="swatch eviction" /> Eviction</span>
+              </>
+            ) : null}
+            {symbols ? (
+              <span className="symbol-key">
+                <i className="swatch mow-flag" /> mow
+                <i className="swatch unmowed-flag" /> unmowed
+                <i className="swatch spray" /> needs wash
+                <i className="swatch sticky-note" /> sticky
+                <i className="swatch key-mark" /> key
+                <i className="swatch guest-mark" /> guest
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        {view === "register" && !manager ? (
+          <div className="data-actions">
+            <div className="seg">
+              <button className="filter" type="button" aria-pressed={registerMode === "short"} onClick={() => setRegisterMode("short")}>
+                Short
+              </button>
+              <button className="filter" type="button" aria-pressed={registerMode === "full"} onClick={() => setRegisterMode("full")}>
+                Full
+              </button>
+              <button className="filter" type="button" aria-pressed={registerMode === "homes"} onClick={() => setRegisterMode("homes")}>
+                Homes
+              </button>
+            </div>
+            <div className="map-slot">
+              <button className="filter" type="button" aria-expanded={dataOpen} onClick={() => setDataOpen((open) => !open)}>
+                Data ▾
+              </button>
+              {dataOpen ? (
+                <div className="map-drop data-drop">
+                  <p className="sync-status">{syncState === "synced" ? "Synced to the office computer." : syncState === "saving" ? "Saving…" : syncState === "offline" ? "Saved on this device. Office computer is not reachable." : "Saved on this device."}</p>
+                  <button type="button" onClick={syncNow}>Sync</button>
+                  <button type="button" onClick={() => { downloadRegister(lots); setDataOpen(false); }}>Download register</button>
+                  <button type="button" onClick={() => { uploadRef.current?.click(); setDataOpen(false); }}>Upload register</button>
+                  <button type="button" onClick={() => { void downloadEverything(lots); setDataOpen(false); }}>Download everything</button>
+                  <button type="button" onClick={() => { backupRef.current?.click(); setDataOpen(false); }}>Upload everything</button>
+                  <button type="button" onClick={() => { quickBooksRef.current?.click(); setDataOpen(false); }}>Import from QuickBooks</button>
+                  <button type="button" onClick={() => { setView("audit"); setDataOpen(false); }}>Audit</button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (versions) {
+                        setVersions(null);
+                        return;
+                      }
+                      void listVersions()
+                        .then((list) => setVersions(list))
+                        .catch(() => setVersions([]));
+                    }}
+                  >
+                    Restore version
+                  </button>
+                  {versions ? (
+                    versions.length ? (
+                      versions.map((version) => (
+                        <button
+                          key={version.id}
+                          type="button"
+                          onClick={() => {
+                            void restoreVersion({ data: { id: version.id } }).then((book) => {
+                              const next = (book.lots as Lot[]).map((lot) => withEmptyMow(lot));
+                              setLots(next);
+                              rememberLots(next);
+                              setVersions(null);
+                              setDataOpen(false);
+                              setQbNote(`Restored ${new Date(version.saved).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}.`);
+                            }).catch(() => setQbNote("That version could not be restored."));
+                          }}
+                        >
+                          {new Date(version.saved).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })} · {version.count} lots
+                        </button>
+                      ))
+                    ) : (
+                      <button type="button" disabled>
+                        No archived versions
+                      </button>
+                    )
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+            {qbNote ? <p className="qb-note">{qbNote}</p> : null}
+          </div>
+        ) : null}
+        <input
+          ref={backupRef}
+          hidden
+          type="file"
+          accept=".json,application/json"
+          onChange={async (e) => {
+            const file = e.target.files?.[0];
+            e.target.value = "";
+            if (!file) return;
+            const text = await file.text();
+            try {
+              const parsed = JSON.parse(text) as { lots?: Lot[]; bills?: unknown; mowings?: unknown; board?: unknown; store?: Record<string, string> };
+              const next = importEverything(text, lots).map(withEmptyMow);
+              setLots(next);
+              rememberLots(next);
+              const payload = masterPayload(next);
+              if (Array.isArray(parsed.bills)) payload.bills = parsed.bills;
+              if (Array.isArray(parsed.mowings)) payload.mowings = parsed.mowings;
+              if (Array.isArray(parsed.board)) payload.board = parsed.board;
+              try {
+                if (await hostUp()) await writeMaster({ data: payload });
+              } catch {
+                /* the file is on this device either way */
+              }
+              try {
+                localStorage.setItem("magnolia-boot-note", "Restored on this device.");
+              } catch {
+                /* the lots are already loaded */
+              }
+              window.location.reload();
+            } catch {
+              setQbNote("That backup could not be read. Use a file from Download everything.");
+            }
+          }}
+        />
+        <input
+          ref={uploadRef}
+          hidden
+          type="file"
+          accept=".csv,text/csv"
+          onChange={async (e) => {
+            const file = e.target.files?.[0];
+            e.target.value = "";
+            if (!file) return;
+            const text = await file.text();
+            setLots((prev) => importRegister(text, prev).map(withEmptyMow));
+          }}
+        />
+        <input
+          ref={quickBooksRef}
+          hidden
+          type="file"
+          accept=".iif,.csv,.txt,text/plain,text/csv"
+          onChange={async (e) => {
+            const file = e.target.files?.[0];
+            e.target.value = "";
+            if (!file) return;
+            const result = importFromQuickBooks(await file.text(), lots);
+            setLots(result.lots.map(withEmptyMow));
+            setQbNote(
+              result.updated
+                ? `QuickBooks updated ${result.updated} lot${result.updated === 1 ? "" : "s"}${result.missed ? `. ${result.missed} names did not match a lot` : ""}.`
+                : result.missed
+                  ? "No lots matched. In QuickBooks 2020 use File, Utilities, Export, Lists to IIF Files, and put the lot number in the customer name."
+                  : "That file did not have any customer rows.",
+            );
+          }}
+        />
+      </div>
+      <div className={view === "meeting" || view === "business" || view === "home" || view === "plant" || view === "handyman" || view === "vendors" || view === "audit" || view === "hoa" || vendorId ? "stage stage-full" : "stage"}>
+        <section className="map-frame">
+          <div className="map-scroll">
+          {!hydrated ? (
+            <p className="qb-note">Loading saved lots…</p>
+          ) : view === "home" ? (
+            session?.role === "manager" ? null : <HomeBoard lots={lots} onOpen={(id) => setView(id as typeof view)} />
+          ) : view === "plant" ? (
+            <TreatmentPlant />
+          ) : view === "handyman" ? (
+            <div className="maint-page">
+              <LowesShop />
+              <div className="seg maint-tabs">
+                <button className="filter" type="button" aria-pressed={maintTab === "work"} onClick={() => setMaintTab("work")}>
+                  Work orders
+                </button>
+                <button className="filter" type="button" aria-pressed={maintTab === "inventory"} onClick={() => setMaintTab("inventory")}>
+                  Inventory
+                </button>
+              </div>
+              {maintTab === "inventory" ? <Inventory /> : <HandymanBoard lots={lots} />}
+            </div>
+          ) : view === "vendors" ? (
+            vendorId ? <VendorPortal vendorId={vendorId} /> : <VendorDirectory />
+          ) : view === "audit" ? (
+            <AuditLog />
+          ) : view === "hoa" ? (
+            <HoaBoard />
+          ) : view === "mgrtodo" ? (
+            <ManagerTodo lots={lots} onOpen={(id) => { openLot(id); setView("map"); }} />
+          ) : view === "todo" ? (
+            <TodoBoard
+              lots={lots}
+              onOpen={(id) => {
+                if (id.startsWith("vendor-")) {
+                  setView("vendors");
+                  return;
+                }
+                openLot(id);
+              }}
+              onSave={saveLot}
+            />
+          ) : view === "mow" ? (
+            <MowBoard lots={lots} onOpen={openLot} />
+          ) : view === "increase" ? (
+            <IncreaseBoard lots={lots} onOpen={openLot} />
+          ) : view === "alert" ? (
+            <AlertBoard lots={lots} onOpen={openLot} />
+          ) : view === "heat" ? (
+            session?.role === "manager" ? null : <HeatBoard lots={lots} scoped={visible} selected={selected} onOpen={openLot} />
+          ) : view === "business" ? (
+            session?.role === "manager" ? null : <BusinessBoard lots={lots} />
+          ) : view === "meeting" ? (
+            session?.role === "manager" ? null : <MeetingBoard lots={lots} onOpen={openLot} onSave={saveLot} resident={Boolean(residentId)} />
+          ) : view === "register" ? (
+            <>
+              <RegisterTable
+                lots={[...lots].filter((lot) => !isOutsideLot(lot)).sort(parkLotOrder)}
+                columns={registerMode === "homes" ? HOME_COLUMNS : registerMode === "full" ? REGISTER_COLUMNS : SHORT_COLUMNS}
+                visibleIds={visibleIds}
+                selected={selected}
+                onChoose={choose}
+                onSave={saveLot}
+              />
+              <h2 className="outside-lots-title">Outside Lots</h2>
+              <RegisterTable
+                lots={[...lots].filter(isOutsideLot).sort(outsideLotOrder)}
+                columns={registerMode === "homes" ? HOME_COLUMNS : registerMode === "full" ? REGISTER_COLUMNS : SHORT_COLUMNS}
+                visibleIds={visibleIds}
+                selected={selected}
+                onChoose={choose}
+                onSave={saveLot}
+              />
+            </>
+          ) : main ? (
+            <div className="map-stack">
+              {([1, 2, 3] as const).map((id) => (
+                <section key={id} id={`map-${id}`} className="map-block">
+                  <div className="map-head">
+                    <div className="map-title-row">
+                      <h2>{SHEET_COPY[id].title}</h2>
+                      {id === 1 && !residentId && !vendorId ? (
+                        <>
+                          <button className="legend-hide legend-symbols" type="button" aria-pressed={symbols} onClick={() => setSymbols((on) => !on)}>Symbols</button>
+                          <button className="legend-hide legend-symbols" type="button" aria-pressed={legendOn} aria-label={legendOn ? "Hide legend" : "Show legend"} onClick={() => setLegendOn((on) => !on)}>Legend</button>
+                        </>
+                      ) : null}
+                    </div>
+                    <button className="print-map" type="button" hidden={Boolean(residentId)} onClick={() => printMap(id)}>
+                      Print map
+                    </button>
+                  </div>
+                  <PlatMap sheet={id} query={residentId || vendorId ? "" : query} filter={residentId || vendorId ? [] : filter} selected={vendorId ? null : selected} lots={lots} symbols={residentId || vendorId ? false : symbols} hideNames={false} onlyNameId={residentId ?? ""} plain={Boolean(vendorId)} stickyIds={vendorId ? undefined : new Set(lots.filter((lot) => lot.stickies?.length).map((lot) => lot.id))} onSelect={vendorId ? () => {} : choose} onCamera={residentId || vendorId ? undefined : () => openDevice("office")} onPlantCamera={residentId || vendorId ? undefined : () => openDevice("plant")} onAlarm={residentId || vendorId ? undefined : () => openDevice("alarm")} alarmOn={alarmOn} />
+                </section>
+              ))}
+            </div>
+          ) : (
+            <>
+              <div className="map-head">
+                <div className="map-title-row">
+                  <h2>{SHEET_COPY[sheet].title}</h2>
+                  {sheet === 1 && !residentId && !vendorId ? (
+                    <>
+                      <button className="legend-hide legend-symbols" type="button" aria-pressed={symbols} onClick={() => setSymbols((on) => !on)}>Symbols</button>
+                      <button className="legend-hide legend-symbols" type="button" aria-pressed={legendOn} aria-label={legendOn ? "Hide legend" : "Show legend"} onClick={() => setLegendOn((on) => !on)}>Legend</button>
+                    </>
+                  ) : null}
+                </div>
+                <button className="print-map" type="button" hidden={Boolean(residentId)} onClick={() => printMap(sheet)}>
+                  Print map
+                </button>
+              </div>
+              <div className="map-stage">
+                <div className="map-scaler">
+                  <PlatMap sheet={sheet} query={residentId || vendorId ? "" : query} filter={residentId || vendorId ? [] : filter} selected={vendorId ? null : selected} lots={lots} symbols={residentId || vendorId ? false : symbols} hideNames={false} onlyNameId={residentId ?? ""} plain={Boolean(vendorId)} stickyIds={vendorId ? undefined : new Set(lots.filter((lot) => lot.stickies?.length).map((lot) => lot.id))} onSelect={vendorId ? () => {} : choose} onCamera={residentId || vendorId ? undefined : () => openDevice("office")} onPlantCamera={residentId || vendorId ? undefined : () => openDevice("plant")} onAlarm={residentId || vendorId ? undefined : () => openDevice("alarm")} alarmOn={alarmOn} />
+                </div>
+              </div>
+              <button
+                className="map-nav prev"
+                type="button"
+                aria-label="Previous lot"
+                onClick={() => stepLot(-1)}
+              >
+                ‹
+              </button>
+              <button
+                className="map-nav next"
+                type="button"
+                aria-label="Next lot"
+                onClick={() => stepLot(1)}
+              >
+                ›
+              </button>
+            </>
+          )}
+          </div>
+          {view === "map" && main && !residentId && !vendorId ? (
+            <>
+              <button
+                className="map-nav prev"
+                type="button"
+                aria-label="Previous lot"
+                onClick={() => stepLot(-1)}
+              >
+                ‹
+              </button>
+              <button
+                className="map-nav next"
+                type="button"
+                aria-label="Next lot"
+                onClick={() => stepLot(1)}
+              >
+                ›
+              </button>
+            </>
+          ) : null}
+        </section>
+        {vendorId || view === "meeting" || view === "business" || view === "home" || view === "plant" || view === "handyman" || view === "vendors" || view === "audit" || view === "resident" ? null : (
+        <LotPanel
+          lot={manager && lot?.managerRequest?.patch ? { ...lot, ...lot.managerRequest.patch, id: lot.id, managerRequest: lot.managerRequest } : residentId ? lots.find((item) => item.id === residentId) ?? null : lot}
+          lots={lots}
+          onSave={manager ? queueManagerEdit : saveLot}
+          onOpen={openLot}
+          onRentRoll={manager ? undefined : () => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("increase"); }}
+          onAlert={manager ? undefined : () => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("alert"); }}
+          focusTab={view === "todo" ? "notes" : view === "mow" ? "mow" : view === "heat" ? "rent" : undefined}
+          resident={Boolean(residentId)}
+          manager={manager}
+        />
+        )}
+      </div>
+    </main>
+  );
+}
+
+type RegisterCol =
+  | { label: string; kind: "field"; field: keyof Lot }
+  | { label: string; kind: "check"; field: "fridge" | "stove" | "washer" | "dryer" | "microwave" }
+  | { label: string; kind: "homeIns" }
+  | { label: string; kind: "insShare" }
+  | { label: string; kind: "lotShare" }
+  | { label: string; kind: "sewerShare" }
+  | { label: string; kind: "waterShare" }
+  | { label: string; kind: "garbageShare" }
+  | { label: string; kind: "homeInsDate" }
+  | { label: string; kind: "emptyCheck"; field: "readyPower" | "readyClean" | "readyInspected" }
+  | { label: string; kind: "zillow" }
+  | { label: string; kind: "zillowUrl" }
+  | { label: string; kind: "homeWide" }
+  | { label: string; kind: "first" }
+  | { label: string; kind: "last" }
+  | { label: string; kind: "status" }
+  | { label: string; kind: "mow" }
+  | { label: string; kind: "roofReplace" }
+  | { label: string; kind: "dogs" }
+  | { label: string; kind: "cats" }
+  | { label: string; kind: "wiring" };
+
+const REGISTER_COLUMNS: RegisterCol[] = [
+  { label: "Lot", kind: "field", field: "lot" },
+  { label: "Address", kind: "field", field: "address" },
+  { label: "Street", kind: "field", field: "street" },
+  { label: "Name(s)", kind: "field", field: "name" },
+  { label: "First name", kind: "first" },
+  { label: "Last name", kind: "last" },
+  { label: "Issues", kind: "field", field: "issues" },
+  { label: "Status", kind: "status" },
+  { label: "Maintenance", kind: "field", field: "maintenance" },
+  { label: "Renter/Owner", kind: "field", field: "renter" },
+  { label: "Rental Amount", kind: "field", field: "rent" },
+  { label: "Lot rent", kind: "field", field: "lotRent" },
+  { label: "Home rent", kind: "field", field: "homeRent" },
+  { label: "08/2026", kind: "field", field: "rentInc2026" },
+  { label: "08/2027", kind: "field", field: "rentInc2027" },
+  { label: "Move-in", kind: "field", field: "moveIn" },
+  { label: "Rent due", kind: "field", field: "rentDue" },
+  { label: "Deposit", kind: "field", field: "deposit" },
+  { label: "Balance", kind: "field", field: "balance" },
+  { label: "Notice date", kind: "field", field: "noticeDate" },
+  { label: "Notice note", kind: "field", field: "noticeNote" },
+  { label: "Lease end", kind: "field", field: "leaseEnd" },
+  { label: "Emergency name", kind: "field", field: "emergencyName" },
+  { label: "Emergency phone", kind: "field", field: "emergencyPhone" },
+  { label: "Court date", kind: "field", field: "courtDate" },
+  { label: "Court note", kind: "field", field: "courtNote" },
+  { label: "Waiting name", kind: "field", field: "waitName" },
+  { label: "Waiting phone", kind: "field", field: "waitPhone" },
+  { label: "Key", kind: "field", field: "key" },
+  { label: "Phone Number", kind: "field", field: "phone" },
+  { label: "Email", kind: "field", field: "email" },
+  { label: "MOW", kind: "mow" },
+  { label: "Late Rent", kind: "field", field: "lateRent" },
+  { label: "Bounced Check", kind: "field", field: "bouncedCheck" },
+  { label: "Guest", kind: "field", field: "guest" },
+  { label: "Vehicle", kind: "field", field: "vehicle" },
+  { label: "A/C Filter", kind: "field", field: "acFilter" },
+  { label: "A/C Cleaning", kind: "field", field: "acCleaning" },
+  { label: "A/C Service", kind: "field", field: "acService" },
+  { label: "Roof age", kind: "field", field: "roofAge" },
+  { label: "Roof material", kind: "field", field: "roofMaterial" },
+  { label: "Roof installed", kind: "field", field: "roofInstalled" },
+  { label: "Roof needs replaced", kind: "roofReplace" },
+  { label: "Exterior Pressure Wash", kind: "field", field: "pressureWash" },
+  { label: "Violations", kind: "field", field: "violations" },
+  { label: "Refrigerator", kind: "check", field: "fridge" },
+  { label: "Stove", kind: "check", field: "stove" },
+  { label: "Washer", kind: "check", field: "washer" },
+  { label: "Dryer", kind: "check", field: "dryer" },
+  { label: "Microwave", kind: "check", field: "microwave" },
+  { label: "Dogs", kind: "dogs" },
+  { label: "Cats", kind: "cats" },
+  { label: "Home wiring insurance", kind: "wiring" },
+  { label: "Home insurance", kind: "homeIns" },
+  { label: "Yearly insurance cost", kind: "insShare" },
+  { label: "Yearly taxes", kind: "lotShare" },
+  { label: "Yearly sewer", kind: "sewerShare" },
+  { label: "Yearly water", kind: "waterShare" },
+  { label: "Yearly garbage", kind: "garbageShare" },
+  { label: "Insurance expires", kind: "homeInsDate" },
+  { label: "Power on", kind: "emptyCheck", field: "readyPower" },
+  { label: "Cleaned", kind: "emptyCheck", field: "readyClean" },
+  { label: "Inspected", kind: "emptyCheck", field: "readyInspected" },
+  { label: "Listed on Zillow", kind: "zillow" },
+  { label: "Zillow link", kind: "zillowUrl" },
+  { label: "Year", kind: "field", field: "homeYear" },
+  { label: "Make", kind: "field", field: "homeMake" },
+  { label: "Model", kind: "field", field: "homeModel" },
+  { label: "Width", kind: "field", field: "homeWidth" },
+  { label: "Length", kind: "field", field: "homeLength" },
+  { label: "Single or double", kind: "homeWide" },
+  { label: "Inspection date", kind: "field", field: "inspectionDate" },
+  { label: "Inspection notes", kind: "field", field: "inspectionNotes" },
+  { label: "Last four", kind: "field", field: "social4" },
+];
+
+const SHORT_COLUMNS: RegisterCol[] = [
+  { label: "Lot", kind: "field", field: "lot" },
+  { label: "Address", kind: "field", field: "address" },
+  { label: "Street", kind: "field", field: "street" },
+  { label: "Name", kind: "field", field: "name" },
+  { label: "MOW", kind: "mow" },
+  { label: "Rent", kind: "field", field: "rent" },
+  { label: "Notes", kind: "field", field: "issues" },
+  { label: "Last four", kind: "field", field: "social4" },
+];
+
+const HOME_COLUMNS: RegisterCol[] = [
+  { label: "Lot", kind: "field", field: "lot" },
+  { label: "Address", kind: "field", field: "address" },
+  { label: "Street", kind: "field", field: "street" },
+  { label: "Name(s)", kind: "field", field: "name" },
+  { label: "Year", kind: "field", field: "homeYear" },
+  { label: "Make", kind: "field", field: "homeMake" },
+  { label: "Model", kind: "field", field: "homeModel" },
+  { label: "Width", kind: "field", field: "homeWidth" },
+  { label: "Length", kind: "field", field: "homeLength" },
+  { label: "Single or double", kind: "homeWide" },
+];
+
+function lotCostShares(lots: Lot[]) {
+  return splitPool(lots, 30000);
+}
+
+function insuranceShares(lots: Lot[]) {
+  return splitPool(
+    lots.filter((lot) => lot.homeIns === "Yes"),
+    7000,
+  );
+}
+
+function splitPool(lots: Lot[], dollars: number) {
+  const shares = new Map<string, number>();
+  if (!lots.length) return shares;
+  const cents = dollars * 100;
+  const base = Math.floor(cents / lots.length);
+  let extra = cents - base * lots.length;
+  for (const lot of lots) {
+    const share = base + (extra > 0 ? 1 : 0);
+    if (extra > 0) extra -= 1;
+    shares.set(lot.id, share / 100);
+  }
+  return shares;
+}
+
+function sewerShares(lots: Lot[]) {
+  return splitPool(lots, 30000);
+}
+
+function waterShares(lots: Lot[]) {
+  return splitPool(lots, 30000);
+}
+
+function garbageShares(lots: Lot[]) {
+  return splitPool(lots, 30000);
+}
+
+function registerText(item: Lot, col: RegisterCol): string {
+  if (col.kind === "check") {
+    const raw = String(item[col.field] ?? "").trim().toLowerCase();
+    return raw !== "" && raw !== "no" ? "Yes" : "";
+  }
+  if (col.kind === "status") return item.status;
+  if (col.kind === "mow") return item.noMow === "Owe" || item.noMow === "NO-OWE" ? "Owe-Mow" : item.noMow === "Yes" || item.noMow === "No" || item.noMow === "Owe-Mow" || item.noMow === "Unmowed" ? item.noMow : "";
+  if (col.kind === "first" || col.kind === "last") {
+    const parts = nameParts(item.name);
+    return col.kind === "first" ? parts.first : parts.last;
+  }
+  if (col.kind === "dogs" || col.kind === "cats") {
+    const value = item[col.kind];
+    return value === "1" || value === "2" ? value : "";
+  }
+  if (col.kind === "homeIns" || col.kind === "homeInsDate") {
+    if (!isRenterLot(item)) return "—";
+    if (col.kind === "homeInsDate") return item.homeInsDate ?? "";
+    return item.homeIns === "Yes" || item.homeIns === "No" ? item.homeIns : "";
+  }
+  if (col.kind === "emptyCheck" || col.kind === "zillow" || col.kind === "zillowUrl") {
+    if (item.status !== "Empty") return "—";
+    if (col.kind === "emptyCheck") return item[col.field] === "Yes" ? "Yes" : "";
+    if (col.kind === "zillow") return item.zillow === "Yes" || item.zillow === "No" ? item.zillow : "";
+    return item.zillowUrl ?? "";
+  }
+  if (col.kind === "roofReplace") return item.roofReplace === "Yes" || item.roofReplace === "No" ? item.roofReplace : "";
+  if (col.kind === "wiring") return item.wiring === "Yes" || item.wiring === "No" ? item.wiring : "";
+  if (col.kind === "homeWide") return item.homeWide === "Single Wide" || item.homeWide === "Double Wide" ? item.homeWide : "";
+  if (col.kind === "field") {
+    const raw = item[col.field];
+    return typeof raw === "string" ? raw : "";
+  }
+  return "";
+}
+
+const RegisterCell = memo(function RegisterCell({
+  item,
+  col,
+  onSave,
+  live,
+}: {
+  item: Lot;
+  col: RegisterCol;
+  onSave: (next: Lot) => void;
+  live: boolean;
+}) {
+  if (!live) return <td>{registerText(item, col)}</td>;
+  const stop = (e: { stopPropagation: () => void }) => e.stopPropagation();
+  if (col.kind === "check") {
+    const raw = String(item[col.field] ?? "").trim().toLowerCase();
+    const on = raw !== "" && raw !== "no";
+    return (
+      <td onClick={stop}>
+        <input
+          type="checkbox"
+          checked={on}
+          onChange={(e) => onSave({ ...item, [col.field]: e.target.checked ? "Yes" : "" })}
+        />
+      </td>
+    );
+  }
+  if (col.kind === "status") {
+    return (
+      <td onClick={stop}>
+        <select
+          className="cell-edit"
+          value={item.status}
+          onChange={(e) => {
+            const status: LotStatus =
+              e.target.value === "Empty" || e.target.value === "Open" || e.target.value === "Eviction"
+                ? e.target.value
+                : "Occupied";
+            onSave({ ...item, status });
+          }}
+        >
+          <option>Occupied</option>
+          <option>Empty</option>
+          <option>Open</option>
+          <option>Eviction</option>
+        </select>
+      </td>
+    );
+  }
+  if (col.kind === "mow") {
+    return (
+      <td onClick={stop}>
+        <select
+          className="cell-edit"
+          value={item.noMow === "Yes" || item.noMow === "No" || item.noMow === "Owe-Mow" || item.noMow === "Owe" || item.noMow === "NO-OWE" || item.noMow === "Unmowed" ? (item.noMow === "Owe" || item.noMow === "NO-OWE" ? "Owe-Mow" : item.noMow) : ""}
+          onChange={(e) => {
+            const noMow = e.target.value;
+            const owed = Number((item.mowCost ?? "").replace(/[$,\s]/g, ""));
+            onSave({ ...item, noMow: Number.isFinite(owed) && owed > 72 ? "Owe-Mow" : noMow });
+          }}
+        >
+          <option value="">—</option>
+          <option>Yes</option>
+          <option>No</option>
+          <option>Owe-Mow</option>
+          <option>Unmowed</option>
+        </select>
+      </td>
+    );
+  }
+  if (col.kind === "roofReplace") {
+    const value = item.roofReplace === "Yes" || item.roofReplace === "No" ? item.roofReplace : "";
+    return (
+      <td onClick={stop}>
+        <select className="cell-edit" value={value} onChange={(e) => onSave({ ...item, roofReplace: e.target.value })}>
+          <option value="">—</option>
+          <option>Yes</option>
+          <option>No</option>
+        </select>
+      </td>
+    );
+  }
+  if (col.kind === "wiring") {
+    const value = item.wiring === "Yes" || item.wiring === "No" ? item.wiring : "";
+    return (
+      <td onClick={stop}>
+        <select className="cell-edit" value={value} onChange={(e) => onSave({ ...item, wiring: e.target.value })}>
+          <option value="">—</option>
+          <option>Yes</option>
+          <option>No</option>
+        </select>
+      </td>
+    );
+  }
+  if (col.kind === "homeIns" || col.kind === "homeInsDate") {
+    if (!isRenterLot(item)) return <td onClick={stop}>—</td>;
+    if (col.kind === "homeInsDate") {
+      return (
+        <td onClick={stop}>
+          <input
+            className="cell-edit"
+            type="date"
+            value={item.homeInsDate ?? ""}
+            onChange={(e) => onSave({ ...item, homeInsDate: e.target.value })}
+          />
+        </td>
+      );
+    }
+    const value = item.homeIns === "Yes" || item.homeIns === "No" ? item.homeIns : "";
+    return (
+      <td onClick={stop}>
+        <select className="cell-edit" value={value} onChange={(e) => onSave({ ...item, homeIns: e.target.value })}>
+          <option value="">—</option>
+          <option>Yes</option>
+          <option>No</option>
+        </select>
+      </td>
+    );
+  }
+  if (col.kind === "emptyCheck" || col.kind === "zillow" || col.kind === "zillowUrl") {
+    if (item.status !== "Empty") return <td onClick={stop}>—</td>;
+    if (col.kind === "emptyCheck") {
+      const on = item[col.field] === "Yes";
+      return (
+        <td onClick={stop}>
+          <input type="checkbox" checked={on} onChange={(e) => onSave({ ...item, [col.field]: e.target.checked ? "Yes" : "" })} />
+        </td>
+      );
+    }
+    if (col.kind === "zillow") {
+      const value = item.zillow === "Yes" || item.zillow === "No" ? item.zillow : "";
+      return (
+        <td onClick={stop}>
+          <select className="cell-edit" value={value} onChange={(e) => onSave({ ...item, zillow: e.target.value })}>
+            <option value="">—</option>
+            <option>Yes</option>
+            <option>No</option>
+          </select>
+        </td>
+      );
+    }
+    return (
+      <td onClick={stop}>
+        <input className="cell-edit" value={item.zillowUrl ?? ""} onChange={(e) => onSave({ ...item, zillowUrl: e.target.value })} />
+      </td>
+    );
+  }
+  if (col.kind === "dogs" || col.kind === "cats") {
+    const value = item[col.kind] === "1" || item[col.kind] === "2" ? item[col.kind] : "";
+    return (
+      <td onClick={stop}>
+        <select className="cell-edit" value={value} onChange={(e) => onSave({ ...item, [col.kind]: e.target.value })}>
+          <option value="">—</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+        </select>
+      </td>
+    );
+  }
+  if (col.kind === "first" || col.kind === "last") {
+    const parts = nameParts(item.name);
+    const value = col.kind === "first" ? parts.first : parts.last;
+    return (
+      <td onClick={stop}>
+        <input
+          className="cell-edit"
+          value={value}
+          onChange={(e) =>
+            onSave({
+              ...item,
+              name: col.kind === "first" ? joinName(parts.last, e.target.value) : joinName(e.target.value, parts.first),
+            })
+          }
+        />
+      </td>
+    );
+  }
+  if (col.kind === "homeWide") {
+    const value = item.homeWide === "Single Wide" || item.homeWide === "Double Wide" ? item.homeWide : "";
+    return (
+      <td onClick={stop}>
+        <select className="cell-edit" value={value} onChange={(e) => onSave({ ...item, homeWide: e.target.value })}>
+          <option value="">—</option>
+          <option>Single Wide</option>
+          <option>Double Wide</option>
+        </select>
+      </td>
+    );
+  }
+  if (col.kind === "field" && col.field === "social4") {
+    return (
+      <td onClick={stop}>
+        <input
+          className="cell-edit"
+          inputMode="numeric"
+          maxLength={4}
+          value={item.social4 ?? ""}
+          onChange={(e) => onSave({ ...item, social4: e.target.value.replace(/\D/g, "").slice(0, 4) })}
+        />
+      </td>
+    );
+  }
+  if (col.kind === "field" && col.field === "renter") {
+    const value = ["Renter", "Owner", "Rent-to-Own"].includes(item.renter) ? item.renter : "";
+    return (
+      <td onClick={stop}>
+        <select className="cell-edit" value={value} onChange={(e) => onSave({ ...item, renter: e.target.value })}>
+          <option value="">—</option>
+          <option>Renter</option>
+          <option>Owner</option>
+          <option>Rent-to-Own</option>
+        </select>
+      </td>
+    );
+  }
+  if (col.kind !== "field") return <td onClick={stop}>—</td>;
+  const field = col.field;
+  return (
+    <td onClick={stop}>
+      <input
+        className="cell-edit"
+        value={String(item[field] ?? "")}
+        onChange={(e) => onSave({ ...item, [field]: e.target.value })}
+      />
+    </td>
+  );
+});
+
+function nameParts(name: string): { first: string; last: string } {
+  const raw = name.trim();
+  if (!raw) return { first: "", last: "" };
+  const comma = raw.indexOf(",");
+  if (comma >= 0) return { last: raw.slice(0, comma).trim(), first: raw.slice(comma + 1).trim() };
+  return { first: "", last: raw };
+}
+
+function joinName(last: string, first: string) {
+  const l = last.trim();
+  const f = first.trim();
+  if (l && f) return `${l}, ${f}`;
+  return l || f;
+}
+
+function neighbors(lots: Lot[], lot: Lot) {
+  const street = lot.street.trim().toLowerCase();
+  const same = lots.filter((item) => item.street.trim().toLowerCase() === street);
+  const list = (same.length > 0 ? same : lots).slice().sort((a, b) => {
+    const na = Number(a.lot);
+    const nb = Number(b.lot);
+    if (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) return na - nb;
+    return a.address.localeCompare(b.address, undefined, { numeric: true });
+  });
+  const index = list.findIndex((item) => item.id === lot.id);
+  return {
+    prev: index > 0 ? list[index - 1] : null,
+    next: index >= 0 && index < list.length - 1 ? list[index + 1] : null,
+  };
+}
+
+function isOutsideLot(lot: Lot) {
+  return lot.id === "4053-Bonnie Drive" || lot.id === "1471-Lake Drive" || lot.id === "3530-Magnolia Terrace Ave" || /\(outside park\)/i.test(lot.lot);
+}
+
+function parkLotOrder(a: Lot, b: Lot) {
+  const aEnd = a.id === "130.5" ? 1 : 0;
+  const bEnd = b.id === "130.5" ? 1 : 0;
+  if (aEnd !== bEnd) return aEnd - bEnd;
+  return byStreetAddress(a, b);
+}
+
+function outsideLotOrder(a: Lot, b: Lot) {
+  const rank = (lot: Lot) => (lot.address === "4053" ? 0 : lot.address === "1471" ? 1 : lot.address === "3530" ? 2 : 3);
+  return rank(a) - rank(b) || a.address.localeCompare(b.address, undefined, { numeric: true });
+}
+
+function byStreetAddress(a: Lot, b: Lot) {
+  const ga = streetGroup(a.street);
+  const gb = streetGroup(b.street);
+  if (ga.rank !== gb.rank) return ga.rank - gb.rank;
+  if (ga.label !== gb.label) return ga.label.localeCompare(gb.label);
+  const address = a.address.localeCompare(b.address, undefined, { numeric: true });
+  if (address) return address;
+  return a.lot.localeCompare(b.lot, undefined, { numeric: true });
+}
+
+function RegisterTable({
+  lots,
+  columns,
+  visibleIds,
+  selected,
+  onChoose,
+  onSave,
+}: {
+  lots: Lot[];
+  columns: RegisterCol[];
+  visibleIds: Set<string>;
+  selected: string | null;
+  onChoose: (id: string) => void;
+  onSave: (next: Lot) => void;
+}) {
+  const pins = columns.findIndex((col) => col.label.startsWith("Name")) + 1;
+  const shares = useMemo(() => insuranceShares(lots), [lots]);
+  const taxes = useMemo(() => lotCostShares(lots), [lots]);
+  const sewer = useMemo(() => sewerShares(lots), [lots]);
+  const water = useMemo(() => waterShares(lots), [lots]);
+  const garbage = useMemo(() => garbageShares(lots), [lots]);
+  return (
+    <table className={`register pin-${pins >= 4 ? 4 : 3}`}>
+      <thead>
+        <tr>
+          {columns.map((col) => (
+            <th key={col.label}>{col.label}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {lots.map((item) => (
+          <tr key={item.id} data-hit={visibleIds.has(item.id)} aria-selected={selected === item.id} onClick={() => onChoose(item.id)}>
+            {columns.map((col) =>
+              col.kind === "insShare" || col.kind === "lotShare" || col.kind === "sewerShare" || col.kind === "waterShare" || col.kind === "garbageShare" ? (
+                <td key={col.label}>
+                  {col.kind === "insShare" && !shares.has(item.id)
+                    ? ""
+                    : dollar(
+                        (col.kind === "insShare"
+                          ? shares
+                          : col.kind === "lotShare"
+                            ? taxes
+                            : col.kind === "sewerShare"
+                              ? sewer
+                              : col.kind === "waterShare"
+                                ? water
+                                : garbage
+                        ).get(item.id) ?? 0,
+                      )}
+                </td>
+              ) : (
+                <RegisterCell key={col.label} item={item} col={col} onSave={onSave} live={selected === item.id} />
+              ),
+            )}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function LoginScreen({ lots, onEnter }: { lots: Lot[]; onEnter: (next: Session) => void }) {
+  const remembered = useState(() => loadRemembered())[0];
+  const [mode, setMode] = useState<LoginMode | null>(remembered?.mode ?? null);
+  const [address, setAddress] = useState(remembered?.address ?? "");
+  const [username, setUsername] = useState(remembered?.username ?? "");
+  const [landlordName, setLandlordName] = useState(remembered?.landlordName ?? "");
+  const [password, setPassword] = useState(remembered?.password ?? "");
+  const [nextPass, setNextPass] = useState("");
+  const [changeOpen, setChangeOpen] = useState(false);
+  const [error, setError] = useState("");
+  const [sent, setSent] = useState("");
+  function pick(next: LoginMode) {
+    setMode(next);
+    setError("");
+    setSent("");
+    setChangeOpen(false);
+    if (next === "manager") setLandlordName("Belkis");
+  }
+  function remember(next: RememberedLogin) {
+    saveRemembered(next);
+  }
+  function forgot() {
+    setError("");
+    const typed = address.trim();
+    if (mode === "resident" && !typed) {
+      setError("Enter the address number, then ask for a new password.");
+      return;
+    }
+    const lot = mode === "resident" ? lots.find((item) => item.address.trim() === typed) : undefined;
+    if (mode === "resident" && !lot) {
+      setError("No lot uses that address number.");
+      return;
+    }
+    const rows = loadResets();
+    const key = lot?.id || (mode === "maintenance" ? "maintenance" : mode === "manager" ? "manager" : "landlord");
+    if (!rows.some((item) => item.lotId === key)) {
+      saveResets([{ id: crypto.randomUUID(), at: new Date().toISOString(), address: lot ? `${lot.address} ${lot.street}` : mode === "maintenance" ? "Maintenance" : mode === "manager" ? "Manager" : "Landlord", lotId: key, name: lot ? lot.name || `Lot ${lot.lot}` : "Clint Horne" }, ...rows]);
+    }
+    setSent("Request sent to Clint Horne. He will set a new password.");
+  }
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    if (!mode) return;
+    if (mode === "landlord") {
+      if (!LANDLORD_USERS.includes(landlordName as (typeof LANDLORD_USERS)[number])) {
+        setError("Choose Clint, Colt, Greg, Jane, or Amanda.");
+        return;
+      }
+      if (password !== landlordPassword()) {
+        setError("That landlord password is not right.");
+        return;
+      }
+      if (nextPass.trim()) {
+        try { localStorage.setItem(LANDLORD_KEY, nextPass.trim()); } catch { /* keep the typed password for this sign-in */ }
+      }
+      onEnter({ role: "landlord", user: landlordName as (typeof LANDLORD_USERS)[number] });
+      remember({ mode: "landlord", landlordName, address, username, password });
+      return;
+    }
+    if (mode === "maintenance") {
+      if (password !== maintenancePassword()) {
+        setError("That maintenance password is not right.");
+        return;
+      }
+      onEnter({ role: "maintenance" });
+      remember({ mode: "maintenance", landlordName, address, username, password });
+      return;
+    }
+    if (mode === "manager") {
+      if (landlordName !== "Belkis") {
+        setError("Choose Belkis.");
+        return;
+      }
+      if (password !== landlordPassword()) {
+        setError("That password is not right.");
+        return;
+      }
+      onEnter({ role: "manager", user: "Belkis" });
+      remember({ mode: "manager", landlordName: "Belkis", address, username, password });
+      return;
+    }
+    if (mode === "vendor") {
+      if (password.trim()) {
+        setError("Leave the vendor password blank.");
+        return;
+      }
+      const word = username.trim().toLowerCase();
+      const vendor = vendorList().find((item) => (item.name.trim().split(/\s+/)[0] ?? "").toLowerCase() === word);
+      if (!word || !vendor) {
+        setError("No company starts with that name.");
+        return;
+      }
+      onEnter({ role: "vendor", vendorId: vendor.id });
+      remember({ mode: "vendor", landlordName, address, username, password: "" });
+      return;
+    }
+    const typed = address.trim();
+    const matches = lots.filter((lot) => lot.address.trim() === typed);
+    const lot = matches.find((item) => residentPassword(item) === password && password.trim());
+    if (!matches.length) {
+      setError("No lot uses that address number.");
+      return;
+    }
+    if (!lot) {
+      setError(matches.every((item) => !residentPassword(item)) ? "That address needs a first name, last name, and the last four before the default password works." : "That password does not match this address.");
+      return;
+    }
+    onEnter({ role: "resident", lotId: lot.id });
+    remember({ mode: "resident", landlordName, address: typed, username, password });
+  }
+  const roles = [
+    ["landlord", "Landlord", "The whole park"],
+    ["manager", "Manager", "Map and the park, not the money"],
+    ["resident", "Resident", "Your home only"],
+    ["maintenance", "Maintenance", "Work orders"],
+    ["vendor", "Vendor", "Your documents"],
+  ] as const;
+  return (
+    <form className="login-card" onSubmit={submit}>
+      <div className="login-brand">
+        <p className="eyebrow">MAGNOLIA ESTATES</p>
+        <h1>Sign in</h1>
+        <p className="quiet">Choose who you are.</p>
+      </div>
+      <div className="login-roles" role="group" aria-label="Who is signing in">
+        {roles.map(([id, title, detail]) => (
+          <button key={id} type="button" className={mode === id ? "login-role is-on" : "login-role"} aria-pressed={mode === id} onClick={() => pick(id)}>
+            <strong>{title}</strong>
+            <span>{detail}</span>
+          </button>
+        ))}
+      </div>
+      {mode === "landlord" || mode === "manager" ? (
+        <div className="login-names" role="group" aria-label="Username">
+          {(mode === "manager" ? MANAGER_USERS : LANDLORD_USERS).map((name) => (
+            <button key={name} type="button" className={landlordName === name ? "login-name is-on" : "login-name"} aria-pressed={landlordName === name} onClick={() => setLandlordName(name)}>{name}</button>
+          ))}
+        </div>
+      ) : null}
+      {mode === "resident" ? (
+        <label>Address number<input name="username" value={address} inputMode="numeric" autoComplete="username" onChange={(e) => setAddress(e.target.value)} /></label>
+      ) : null}
+      {mode === "vendor" ? (
+        <label>Username<input name="username" value={username} autoComplete="username" placeholder="First word of the company" onChange={(e) => setUsername(e.target.value)} /></label>
+      ) : null}
+      {mode ? (
+        <label>
+          {mode === "vendor" ? "Password, leave blank" : "Password"}
+          <input name="password" type="password" value={password} autoComplete="current-password" placeholder={mode === "vendor" ? "Leave blank" : ""} onChange={(e) => setPassword(e.target.value)} />
+        </label>
+      ) : null}
+      {mode === "landlord" ? (
+        <button className="login-change" type="button" onClick={() => setChangeOpen((open) => !open)}>{changeOpen ? "Hide password change" : "Change landlord password"}</button>
+      ) : null}
+      {mode === "landlord" && changeOpen ? (
+        <label>New landlord password<input type="password" value={nextPass} placeholder="Leave blank to keep it" autoComplete="new-password" onChange={(e) => setNextPass(e.target.value)} /></label>
+      ) : null}
+      {mode === "resident" ? <p className="login-explain">Use your address number and the password the park gave you. That password is your first initial, your last initial, your last four, then @&. You can see the map and your own home. Changes wait for Clint Horne to approve them.</p> : null}
+      {mode === "manager" ? <p className="login-explain">Choose Belkis. The password is the same one the landlord uses. Business and Financial stay off this sign-in.</p> : null}
+      {mode === "vendor" ? <p className="login-explain">The username is the first word of your company name. Leave the password blank. You can upload liability, license, and workers comp, and see the map with the name, address, and lot number.</p> : null}
+      {error ? <p className="login-error">{error}</p> : null}
+      {sent ? <p className="quiet">{sent}</p> : null}
+      {mode ? <button className="business-primary" type="submit">Sign in</button> : null}
+      {mode && mode !== "vendor" ? <button className="business-secondary" type="button" onClick={forgot}>Forgot password</button> : null}
+    </form>
+  );
+}
+
+function PasswordResets({ lots, onSave }: { lots: Lot[]; onSave?: (lot: Lot) => void }) {
+  const [rows, setRows] = useState<ResetAsk[]>(loadResets);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const refresh = () => setRows(loadResets());
+    window.addEventListener("magnolia-resets", refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener("magnolia-resets", refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, []);
+  if (!rows.length) return null;
+  function give(row: ResetAsk) {
+    const next = (drafts[row.id] ?? "").trim();
+    if (!next) return;
+    if (row.lotId === "landlord") {
+      try { localStorage.setItem(LANDLORD_KEY, next); } catch { /* the new password is still typed */ }
+    } else if (row.lotId === "maintenance") {
+      try { localStorage.setItem("magnolia-maint-pass", next); } catch { /* the new password is still typed */ }
+    } else if (row.lotId === "manager") {
+      try { localStorage.setItem(LANDLORD_KEY, next); } catch { /* the new password is still typed */ }
+    } else {
+      const lot = lots.find((item) => item.id === row.lotId);
+      if (lot && onSave) onSave({ ...lot, residentPass: next });
+    }
+    const left = loadResets().filter((item) => item.id !== row.id);
+    saveResets(left);
+    setRows(left);
+  }
+  return (
+    <section>
+      <h3>Password requests for Clint Horne</h3>
+      <div className="resident-links">
+        {rows.map((row) => (
+          <article key={row.id} className="resident-link">
+            <div>
+              <strong>{row.name || "Resident"}</strong>
+              <small>{row.address} asked for a new password</small>
+            </div>
+            <input value={drafts[row.id] ?? ""} placeholder="New password" onChange={(e) => setDrafts((current) => ({ ...current, [row.id]: e.target.value }))} />
+            <button type="button" className="business-primary" onClick={() => give(row)}>Set password</button>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ManagerTodo({ lots, onOpen }: { lots: Lot[]; onOpen: (id: string) => void }) {
+  const key = "magnolia-manager-todos";
+  type Task = { id: string; text: string; done: boolean; lotId?: string };
+  const [items, setItems] = useState<Task[]>(() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem(key) ?? "[]") as Task[];
+      return Array.isArray(raw) ? raw.filter((item) => item && typeof item.text === "string") : [];
+    } catch {
+      return [];
+    }
+  });
+  const [text, setText] = useState("");
+  const [lotId, setLotId] = useState("");
+  useEffect(() => {
+    try { localStorage.setItem(key, JSON.stringify(items)); } catch { /* the list stays on screen */ }
+  }, [items]);
+  const today = new Date();
+  const iso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  const notes = lots.filter((lot) => noteIsToday(lot.issues ?? ""));
+  const leaving = lots.flatMap((lot) => (lot.guests ?? []).filter((guest) => guest.departure === iso).map((guest) => ({ lot, guest })));
+  const mow = lots.filter((lot) => lot.noMow === "Unmowed" || /need(?:s)? mow/i.test(lot.issues ?? ""));
+  const choices = [...lots].filter((lot) => lot.lot.trim()).sort((a, b) => Number(a.lot) - Number(b.lot) || a.lot.localeCompare(b.lot));
+  return (
+    <div className="home-board">
+      <header className="home-head">
+        <div>
+          <p className="eyebrow">MANAGER</p>
+          <h2>Today</h2>
+        </div>
+      </header>
+      <ul className="resident-links">
+        {notes.map((lot) => (
+          <li key={`note-${lot.id}`} className="resident-link">
+            <button type="button" onClick={() => onOpen(lot.id)}><strong>Note · Lot {lot.lot}</strong><small>{lot.issues}</small></button>
+          </li>
+        ))}
+        {leaving.map(({ lot, guest }) => (
+          <li key={`guest-${lot.id}-${guest.name}`} className="resident-link">
+            <button type="button" onClick={() => onOpen(lot.id)}><strong>Guest leaving · Lot {lot.lot}</strong><small>{guest.name || "Guest"} · {lot.address}</small></button>
+          </li>
+        ))}
+        {mow.map((lot) => (
+          <li key={`mow-${lot.id}`} className="resident-link">
+            <button type="button" onClick={() => onOpen(lot.id)}><strong>Needs mow · Lot {lot.lot}</strong><small>{lot.name || lot.address}</small></button>
+          </li>
+        ))}
+        {!notes.length && !leaving.length && !mow.length ? <li className="resident-link"><span>Nothing dated today.</span></li> : null}
+      </ul>
+      <header className="home-head">
+        <div>
+          <h2>To-do</h2>
+        </div>
+      </header>
+      <form className="plant-row" onSubmit={(event) => {
+        event.preventDefault();
+        const next = text.trim();
+        if (!next) return;
+        setItems((current) => [{ id: crypto.randomUUID(), text: next, done: false, lotId }, ...current]);
+        setText("");
+      }}>
+        <label>Add<input value={text} onChange={(e) => setText(e.target.value)} /></label>
+        <label>Lot
+          <select className="mow-select" value={lotId} onChange={(e) => setLotId(e.target.value)}>
+            <option value="">No lot</option>
+            {choices.map((lot) => <option key={lot.id} value={lot.id}>{lot.lot} {lot.name}</option>)}
+          </select>
+        </label>
+        <button className="business-primary" type="submit">Add</button>
+      </form>
+      {items.length ? (
+        <ul className="resident-links">
+          {items.map((item) => {
+            const home = lots.find((lot) => lot.id === item.lotId);
+            return (
+              <li key={item.id} className="resident-link">
+                <label className="stock-check">
+                  <input type="checkbox" checked={item.done} onChange={() => setItems((current) => current.map((row) => row.id === item.id ? { ...row, done: !row.done } : row))} />
+                  <button type="button" disabled={!item.lotId} onClick={() => item.lotId && onOpen(item.lotId)} style={item.done ? { textDecoration: "line-through" } : undefined}>{item.text}{home ? ` · Lot ${home.lot}` : ""}</button>
+                </label>
+                <button type="button" className="business-delete" onClick={() => setItems((current) => current.filter((row) => row.id !== item.id))}>Remove</button>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+function HoaBoard() {
+  const [items, setItems] = useState<HoaItem[]>(() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem(HOA_KEY) ?? "[]") as HoaItem[];
+      return Array.isArray(raw) ? raw.filter((item) => item && typeof item.text === "string") : [];
+    } catch {
+      return [];
+    }
+  });
+  const [text, setText] = useState("");
+  useEffect(() => {
+    try { localStorage.setItem(HOA_KEY, JSON.stringify(items)); } catch { /* the list stays on screen */ }
+  }, [items]);
+  return (
+    <div className="home-board">
+      <header className="home-head">
+        <div>
+          <p className="eyebrow">HOA</p>
+          <h2>To-do</h2>
+        </div>
+      </header>
+      <form className="plant-row" onSubmit={(event) => {
+        event.preventDefault();
+        const next = text.trim();
+        if (!next) return;
+        setItems((current) => [{ id: crypto.randomUUID(), text: next, done: false }, ...current]);
+        setText("");
+      }}>
+        <label>Add<input value={text} onChange={(e) => setText(e.target.value)} /></label>
+        <button className="business-primary" type="submit">Add</button>
+      </form>
+      {items.length ? (
+        <ul className="resident-links">
+          {items.map((item) => (
+            <li key={item.id} className="resident-link">
+              <label className="stock-check">
+                <input type="checkbox" checked={item.done} onChange={() => setItems((current) => current.map((row) => row.id === item.id ? { ...row, done: !row.done } : row))} />
+                <span style={item.done ? { textDecoration: "line-through" } : undefined}>{item.text}</span>
+              </label>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+function ResidentLinks({ lots }: { lots: Lot[] }) {
+  const [copied, setCopied] = useState("");
+  const rows = lots.filter((lot) => !/\(outside park\)/i.test(lot.lot) && (lot.status === "Occupied" || lot.name.trim()));
+  return (
+    <div className="home-board">
+      <header className="home-head">
+        <div>
+          <p className="eyebrow">RESIDENT</p>
+          <h2>Resident links</h2>
+        </div>
+      </header>
+      <p className="quiet">Copy a link for one home. It opens a plain map with no names and no other tabs. They can only open their own lot, and name, phone, email, and guest card changes wait here for approval.</p>
+      <div className="resident-links">
+        {rows.map((lot) => (
+          <div key={lot.id} className="resident-link">
+            <div>
+              <strong>{displayName(lot) || `Lot ${lot.lot}`}</strong>
+              <small>{lot.address} {lot.street} · Lot {lot.lot}</small>
+            </div>
+            <button
+              type="button"
+              className="business-secondary"
+              onClick={() => {
+                const url = `${window.location.origin}${window.location.pathname}?resident=${encodeURIComponent(lot.id)}`;
+                void navigator.clipboard.writeText(url).then(() => {
+                  setCopied(lot.id);
+                  window.setTimeout(() => setCopied(""), 1200);
+                });
+              }}
+            >
+              {copied === lot.id ? "Copied" : "Copy link"}
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ResidentLot({ lot, onSave }: { lot: Lot; onSave: (next: Lot) => void }) {
+  const pending = lot.residentRequest;
+  const [name, setName] = useState(pending?.name ?? lot.name);
+  const [phone, setPhone] = useState(pending?.phone ?? lot.phone);
+  const [email, setEmail] = useState(pending?.email ?? lot.email);
+  const [card, setCard] = useState<{ name: string; data: string } | null>(pending?.guestCard ?? null);
+  const [homeYear, setHomeYear] = useState(pending?.homeYear ?? lot.homeYear ?? "");
+  const [homeMake, setHomeMake] = useState(pending?.homeMake ?? lot.homeMake ?? "");
+  const [homeModel, setHomeModel] = useState(pending?.homeModel ?? lot.homeModel ?? "");
+  const [homeWidth, setHomeWidth] = useState(pending?.homeWidth ?? lot.homeWidth ?? "");
+  const [homeLength, setHomeLength] = useState(pending?.homeLength ?? lot.homeLength ?? "");
+  const [homeWide, setHomeWide] = useState(pending?.homeWide ?? lot.homeWide ?? "");
+  const [sent, setSent] = useState(Boolean(pending));
+  useEffect(() => {
+    const next = lot.residentRequest;
+    setName(next?.name ?? lot.name);
+    setPhone(next?.phone ?? lot.phone);
+    setEmail(next?.email ?? lot.email);
+    setCard(next?.guestCard ?? null);
+    setHomeYear(next?.homeYear ?? lot.homeYear ?? "");
+    setHomeMake(next?.homeMake ?? lot.homeMake ?? "");
+    setHomeModel(next?.homeModel ?? lot.homeModel ?? "");
+    setHomeWidth(next?.homeWidth ?? lot.homeWidth ?? "");
+    setHomeLength(next?.homeLength ?? lot.homeLength ?? "");
+    setHomeWide(next?.homeWide ?? lot.homeWide ?? "");
+    setSent(Boolean(next));
+  }, [lot]);
+  return (
+    <aside className="panel">
+      <div className="panel-body">
+        <p className="quiet">{lot.address} {lot.street} · Lot {lot.lot}</p>
+        <p className="resident-note">These are your personal and home details. An edit is sent to the landlord as a to-do. Nothing changes until they approve it.</p>
+        <label className="wiring-field"><span>Name</span><input value={name} onChange={(e) => setName(e.target.value)} /></label>
+        <label className="wiring-field"><span>Phone</span><input value={phone} onChange={(e) => setPhone(e.target.value)} /></label>
+        <label className="wiring-field"><span>Email</span><input value={email} onChange={(e) => setEmail(e.target.value)} /></label>
+        <label className="wiring-field">
+          <span>Upload guest card</span>
+          <input
+            type="file"
+            accept="image/*,.pdf"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (!file) return;
+              const reader = new FileReader();
+              reader.onload = () => setCard({ name: file.name, data: String(reader.result ?? "") });
+              reader.readAsDataURL(file);
+            }}
+          />
+        </label>
+        {card?.name ? <p className="quiet">{card.name}</p> : null}
+        <p className="pet-title">Home</p>
+        <div className="pet-row">
+          <label><span>Year</span><input value={homeYear} onChange={(e) => setHomeYear(e.target.value)} /></label>
+          <label><span>Make</span><input value={homeMake} onChange={(e) => setHomeMake(e.target.value)} /></label>
+          <label><span>Model</span><input value={homeModel} onChange={(e) => setHomeModel(e.target.value)} /></label>
+        </div>
+        <div className="pet-row">
+          <label><span>Width</span><input value={homeWidth} onChange={(e) => setHomeWidth(e.target.value)} /></label>
+          <label><span>Length</span><input value={homeLength} onChange={(e) => setHomeLength(e.target.value)} /></label>
+          <label>
+            <span>Wide</span>
+            <select className="mow-select" value={homeWide === "Single Wide" || homeWide === "Double Wide" ? homeWide : ""} onChange={(e) => setHomeWide(e.target.value)}>
+              <option value="">—</option>
+              <option>Single Wide</option>
+              <option>Double Wide</option>
+            </select>
+          </label>
+        </div>
+        <button
+          type="button"
+          className="business-primary"
+          onClick={() => {
+            onSave({
+              ...lot,
+              residentRequest: {
+                at: new Date().toISOString(),
+                name: name.trim(),
+                phone: phone.trim(),
+                email: email.trim(),
+                guestCard: card,
+                homeYear: homeYear.trim(),
+                homeMake: homeMake.trim(),
+                homeModel: homeModel.trim(),
+                homeWidth: homeWidth.trim(),
+                homeLength: homeLength.trim(),
+                homeWide,
+              },
+            });
+            setSent(true);
+          }}
+        >
+          Send for approval
+        </button>
+        {sent ? <p className="quiet">Waiting for the landlord.</p> : null}
+      </div>
+    </aside>
+  );
+}
+
+function ManagerApproval({ lot, onSave }: { lot: Lot; onSave: (next: Partial<Lot>) => void }) {
+  const ask = lot.managerRequest;
+  if (!ask) return null;
+  const lines = Object.entries(ask.patch).slice(0, 8).map(([key, value]) => `${key}: ${typeof value === "string" ? value || "—" : "updated"}`);
+  return (
+    <div className="resident-ask">
+      <p className="pet-title">Manager change</p>
+      {lines.map((line) => <p key={line}>{line}</p>)}
+      <div className="plant-row">
+        <button type="button" className="business-primary" onClick={() => onSave({ ...ask.patch, managerRequest: null })}>Approve</button>
+        <button type="button" className="business-secondary" onClick={() => onSave({ managerRequest: null })}>Deny</button>
+      </div>
+    </div>
+  );
+}
+
+function ResidentApproval({ lot, onSave }: { lot: Lot; onSave: (next: Partial<Lot>) => void }) {
+  const ask = lot.residentRequest;
+  if (!ask) return null;
+  function approve() {
+    if (!ask) return;
+    const guests = [...(lot.guests ?? [])];
+    if (ask.guestCard) {
+      if (guests[0]) guests[0] = { ...guests[0], card: ask.guestCard };
+      else guests.push({ ...blankGuest(), card: ask.guestCard });
+    }
+    onSave({
+      name: ask.name,
+      phone: ask.phone,
+      email: ask.email,
+      homeYear: ask.homeYear ?? lot.homeYear,
+      homeMake: ask.homeMake ?? lot.homeMake,
+      homeModel: ask.homeModel ?? lot.homeModel,
+      homeWidth: ask.homeWidth ?? lot.homeWidth,
+      homeLength: ask.homeLength ?? lot.homeLength,
+      homeWide: ask.homeWide === "Single Wide" || ask.homeWide === "Double Wide" ? ask.homeWide : lot.homeWide,
+      guests,
+      guest: guests.length ? String(Math.min(guests.length, 5)) : lot.guest,
+      residentRequest: null,
+    });
+  }
+  return (
+    <div className="resident-ask">
+      <p className="pet-title">Resident request</p>
+      <p>Name: {ask.name || "—"}</p>
+      <p>Phone: {ask.phone || "—"}</p>
+      <p>Email: {ask.email || "—"}</p>
+      {ask.guestCard?.data ? <p><a href={ask.guestCard.data} download={ask.guestCard.name}>{ask.guestCard.name || "Guest card"}</a></p> : <p>No guest card</p>}
+      <div className="plant-row">
+        <button type="button" className="business-primary" onClick={approve}>Approve</button>
+        <button type="button" className="business-secondary" onClick={() => onSave({ residentRequest: null })}>Deny</button>
+      </div>
+    </div>
+  );
+}
+
+function LotPanel({ lot, lots, onSave, onOpen, onRentRoll, onAlert, focusTab, resident = false, manager = false }: { lot: Lot | null; lots: Lot[]; onSave: (next: Lot) => void; onOpen: (id: string) => void; onRentRoll: () => void; onAlert: () => void; focusTab?: "personal" | "home" | "rent" | "maintenance" | "notes" | "empty" | "mow"; resident?: boolean; manager?: boolean }) {
+  const [tab, setTab] = useState<"personal" | "home" | "rent" | "maintenance" | "notes" | "empty">("personal");
+  const [copied, setCopied] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef(0);
+  const seenLot = useRef(lot?.id);
+
+  useEffect(() => {
+    if (focusTab === "mow") setTab("maintenance");
+    else if (focusTab) setTab(focusTab);
+    else if (lot && tab === "empty" && lot.status !== "Empty") setTab("personal");
+  }, [lot?.id, lot?.status, focusTab]);
+
+  const focused = useRef("");
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    const changed = seenLot.current !== lot?.id;
+    if (changed) seenLot.current = lot?.id;
+    const key = `${lot?.id ?? ""}:${focusTab ?? ""}:${tab}`;
+    const ready = focusTab === "mow" ? tab === "maintenance" : Boolean(focusTab) && tab === focusTab;
+    if (focusTab && ready && focused.current !== key) {
+      focused.current = key;
+      const target = panel.querySelector<HTMLElement>(`[data-detail="${focusTab}"]`);
+      if (target) {
+        const delta = target.getBoundingClientRect().top - panel.getBoundingClientRect().top;
+        panel.scrollTop += delta - Math.max(8, (panel.clientHeight - target.offsetHeight) / 2);
+      }
+      scrollRef.current = panel.scrollTop;
+      return;
+    }
+    if (changed) {
+      panel.scrollTop = 0;
+      scrollRef.current = 0;
+      return;
+    }
+    panel.scrollTop = scrollRef.current;
+  });
+
+  if (!lot) {
+    return (
+      <aside className="panel">
+        <div className="panel-body">
+          <p className="quiet">{resident ? "Tap your own lot on the map." : "Select a lot on the map."}</p>
+        </div>
+      </aside>
+    );
+  }
+  if (resident) return <ResidentLot lot={lot} onSave={onSave} />;
+  const current = lot;
+  const mates = neighbors(lots, current);
+  const phoneDigits = current.phone.replace(/[^\d+]/g, "");
+  const rentMark = Boolean(current.lateRent?.trim() || current.bouncedCheck?.trim());
+  const notesMark = Boolean(current.issues?.trim() || current.violations?.trim());
+  const save = (next: Partial<Lot>) => {
+    if (panelRef.current) scrollRef.current = panelRef.current.scrollTop;
+    const y = window.scrollY;
+    onSave({ ...current, ...next });
+    requestAnimationFrame(() => {
+      if (panelRef.current) panelRef.current.scrollTop = scrollRef.current;
+      if (Math.abs(window.scrollY - y) > 4) window.scrollTo(0, y);
+    });
+  };
+  async function copyAddress() {
+    const text = [current.address, current.street].filter(Boolean).join(" ");
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      /* the button still confirms */
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  }
+  return (
+    <aside className="panel">
+      <div
+        className="panel-body"
+        ref={panelRef}
+        onScroll={() => {
+          if (panelRef.current) scrollRef.current = panelRef.current.scrollTop;
+        }}
+      >
+      {current.residentRequest ? <ResidentApproval lot={current} onSave={save} /> : null}
+      {!manager && current.managerRequest ? <ManagerApproval lot={current} onSave={save} /> : null}
+      {manager && current.managerRequest ? <p className="resident-note">Waiting for the landlord. The park still shows the old details until they approve.</p> : null}
+      <div className="lot-head">
+        <div className="head-address">
+          <label>
+            <span className="label-row">
+              Address
+              <button className="mini" type="button" onClick={copyAddress}>
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </span>
+            <input className="address-num" value={lot.address} onChange={(e) => save({ address: e.target.value })} />
+          </label>
+          <label>
+            <span>Street</span>
+            <input className="street-name" value={lot.street} onChange={(e) => save({ street: e.target.value })} />
+          </label>
+        </div>
+        <label className="head-lot">
+          <span>Lot</span>
+          <input value={lot.lot} onChange={(e) => save({ lot: e.target.value })} />
+        </label>
+        <label className="head-name">
+          <span>Name</span>
+          <textarea rows={1} value={lot.name} onChange={(e) => save({ name: e.target.value })} />
+        </label>
+        {/^yes$/i.test(lot.key.trim()) ? <p className="key-have">I have a key</p> : null}
+        <label className={noteIsToday(lot.issues) ? "head-notes is-today" : "head-notes"}>
+          <span>Notes</span>
+          <textarea rows={3} value={lot.issues} onChange={(e) => save({ issues: e.target.value })} />
+        </label>
+        <NameSplit name={lot.name} onChange={(name) => save({ name })} />
+        <label className="head-status">
+          <span>Status</span>
+          <span className={`status-dot status-${lot.status.toLowerCase()}`} aria-hidden="true" />
+          <select
+            value={lot.status}
+            onChange={(e) => {
+              const status = e.target.value as LotStatus;
+              if (lot.status === "Occupied" && status === "Empty") {
+                onSave(moveOutLot(lot));
+                setTab("empty");
+                return;
+              }
+              save({ status });
+              if (status === "Empty") setTab("empty");
+              else if (tab === "empty") setTab("personal");
+            }}
+          >
+            <option value="Occupied">Occupied</option>
+            <option value="Empty">Empty</option>
+            <option value="Open">Office</option>
+            <option value="Eviction">Eviction</option>
+          </select>
+        </label>
+      </div>
+      <div className="detail-tabs" role="tablist">
+        {(lot.status === "Empty"
+          ? ([
+              ["empty", "Empty lot"],
+              ["personal", "Personal"],
+              ["home", "Home"],
+              ["rent", "Rent"],
+              ["maintenance", "Maintenance"],
+              ["notes", "Notes"],
+            ] as const)
+          : ([
+              ["personal", "Personal"],
+              ["home", "Home"],
+              ["rent", "Rent"],
+              ["maintenance", "Maintenance"],
+              ["notes", "Notes"],
+            ] as const)
+        ).filter(([id]) => !(manager && id === "rent")).map(([id, label]) => {
+          const mark = (id === "rent" && rentMark) || (id === "notes" && notesMark);
+          return (
+            <button key={id} type="button" role="tab" data-tab={id} aria-pressed={tab === id} onClick={() => setTab(id)}>
+              {label}
+              {mark ? <i className="tab-dot" aria-label="Has something to see" /> : null}
+            </button>
+          );
+        })}
+      </div>
+      {tab === "personal" ? (
+        <>
+          <div className="pet-block">
+            <p className="pet-title">People</p>
+            <div className="pet-row">
+              <label>
+                <span>Phone</span>
+                <span className="phone-line">
+                  <input value={lot.phone} onChange={(e) => save({ phone: e.target.value })} />
+                  {phoneDigits ? <a href={`tel:${phoneDigits}`}>Call</a> : null}
+                </span>
+              </label>
+              <label>
+                <span>Email</span>
+                <input value={lot.email} onChange={(e) => save({ email: e.target.value })} />
+              </label>
+            </div>
+            <div className="pet-row">
+              <label>
+                <span>Renter / owner</span>
+                <select
+                  className="mow-select"
+                  value={["Renter", "Owner", "Rent-to-Own"].includes(lot.renter) ? lot.renter : ""}
+                  onChange={(e) => save({ renter: e.target.value })}
+                >
+                  <option value="">—</option>
+                  <option>Renter</option>
+                  <option>Owner</option>
+                  <option>Rent-to-Own</option>
+                </select>
+              </label>
+              <label>
+                <span>Key</span>
+                <input value={lot.key} onChange={(e) => save({ key: e.target.value })} />
+              </label>
+            </div>
+            <div className="pet-row">
+              <label>
+                <span>Guest</span>
+                <select
+                  className="mow-select"
+                  value={["1", "2", "3", "4", "5"].includes(lot.guest) ? lot.guest : ""}
+                  onChange={(e) => {
+                    const count = Number(e.target.value);
+                    const prev = lot.guests ?? [];
+                    const guests = count > 0 ? Array.from({ length: count }, (_, i) => prev[i] ?? blankGuest()) : [];
+                    save({ guest: e.target.value, guests });
+                  }}
+                >
+                  <option value="">—</option>
+                  <option>1</option>
+                  <option>2</option>
+                  <option>3</option>
+                  <option>4</option>
+                  <option>5</option>
+                </select>
+              </label>
+              <label>
+                <span>Vehicle</span>
+                <input value={lot.vehicle} onChange={(e) => save({ vehicle: e.target.value })} />
+              </label>
+            </div>
+            {(lot.guests ?? []).length > 0 ? <GuestCards guests={lot.guests ?? []} onChange={(guests) => save({ guests })} /> : null}
+            <p className="pet-title">Pets</p>
+            <PetSelects dogs={lot.dogs ?? ""} cats={lot.cats ?? ""} onChange={save} />
+          </div>
+          <LotExtras values={lot} part="personal" onChange={save} />
+          <div className="pet-block">
+            <label className="wiring-field">
+              <span>Last four</span>
+              <input value={lot.social4 ?? ""} inputMode="numeric" maxLength={4} autoComplete="off" placeholder="0000" onChange={(e) => save({ social4: e.target.value.replace(/\D/g, "").slice(0, 4) })} />
+            </label>
+            <label className="wiring-field">
+              <span>Resident password</span>
+              <input value={lot.residentPass ?? ""} autoComplete="off" placeholder={residentPassword({ ...lot, residentPass: "" }) || "First initial, last initial, last four, @&"} onChange={(e) => save({ residentPass: e.target.value })} />
+            </label>
+            <p className="quiet">{(lot.residentPass ?? "").trim() ? "Custom password is on. Clear it to use the default." : residentPassword(lot) ? `Default password is ${residentPassword(lot)}` : "Default is first initial, last initial, last four, then @&."}</p>
+          </div>
+        </>
+      ) : null}
+      {tab === "home" ? (
+        <>
+          <HomeDetails lot={lot} onChange={save} />
+          <LotExtras values={lot} part="home" onChange={save} />
+          <div className="pet-block">
+            <p className="pet-title">Insurance</p>
+            <HomeInsuranceFields
+              lot={lot}
+              onChange={save}
+              split={(() => {
+                const share = insuranceShares(lots).get(lot.id);
+                return share == null ? "" : dollar(share);
+              })()}
+            />
+            <label className="wiring-field">
+              <span>Home wiring insurance</span>
+              <select
+                className="mow-select"
+                value={lot.wiring === "Yes" || lot.wiring === "No" ? lot.wiring : ""}
+                onChange={(e) => save({ wiring: e.target.value })}
+              >
+                <option value="">—</option>
+                <option>Yes</option>
+                <option>No</option>
+              </select>
+            </label>
+          </div>
+          <div className="pet-block">
+            <p className="pet-title">Expenses</p>
+            <label className="wiring-field">
+              <span>Yearly taxes</span>
+              <input value={dollar(lotCostShares(lots).get(lot.id) ?? 0)} readOnly />
+            </label>
+            <label className="wiring-field">
+              <span>Maintenance</span>
+              <input value={costSum([lot.maintCost, lot.mowCost, lot.acCost, lot.roofCost, lot.washCost, lot.inspectCost])} readOnly />
+            </label>
+            <label className="wiring-field">
+              <span>Yearly sewer</span>
+              <input value={dollar(sewerShares(lots).get(lot.id) ?? 0)} readOnly />
+            </label>
+            <label className="wiring-field">
+              <span>Yearly water</span>
+              <input value={dollar(waterShares(lots).get(lot.id) ?? 0)} readOnly />
+            </label>
+            <label className="wiring-field">
+              <span>Yearly garbage</span>
+              <input value={dollar(garbageShares(lots).get(lot.id) ?? 0)} readOnly />
+            </label>
+          </div>
+        </>
+      ) : null}
+      {tab === "rent" ? (
+        <div data-detail="rent">
+          <LotExtras values={lot} part="rent" onChange={save} onMoveOut={() => { onSave(moveOutLot(lot)); setTab("empty"); }} onRentRoll={onRentRoll} />
+        </div>
+      ) : null}
+      {tab === "maintenance" ? (
+        <div data-detail="maintenance">
+          <LotExtras values={lot} part="maintenance" onChange={save} />
+        </div>
+      ) : null}
+      {tab === "notes" ? (
+        <div className="pet-block" data-detail="notes">
+          <p className="pet-title">Issues</p>
+          <label className="wiring-field">
+            <span>Note</span>
+            <textarea rows={4} value={lot.issues} onChange={(e) => save({ issues: e.target.value })} />
+          </label>
+          {lot.stickies?.length ? (
+            <div className="lot-stickies">
+              {lot.stickies.map((sticky) => (
+                <p key={sticky.id} style={{ background: sticky.color }}>{sticky.text}</p>
+              ))}
+            </div>
+          ) : null}
+          <label className="wiring-field">
+            <span>Violations</span>
+            <textarea rows={3} value={lot.violations} onChange={(e) => save({ violations: e.target.value })} />
+          </label>
+          <button className="filter" type="button" onClick={onAlert}>
+            Emergency broadcast
+          </button>
+        </div>
+      ) : null}
+      {tab === "empty" ? (
+        <>
+          <PreviousTenants values={lot} onChange={save} />
+          <EmptyLotChecklist lot={lot} onChange={save} />
+          <LotExtras values={lot} part="empty" onChange={save} />
+        </>
+      ) : null}
+      </div>
+      <button className="panel-nav prev" type="button" aria-label="Previous lot" disabled={!mates.prev} onClick={() => mates.prev && onOpen(mates.prev.id)}>
+        ‹
+      </button>
+      <button className="panel-nav next" type="button" aria-label="Next lot" disabled={!mates.next} onClick={() => mates.next && onOpen(mates.next.id)}>
+        ›
+      </button>
+    </aside>
+  );
+}
+
+function HomeDetails({ lot, onChange }: { lot: Lot; onChange: (next: Partial<Lot>) => void }) {
+  const wide = lot.homeWide === "Single Wide" || lot.homeWide === "Double Wide" ? lot.homeWide : "";
+  return (
+    <div className="pet-block">
+      <p className="pet-title">Home details</p>
+      <div className="pet-row">
+        <label>
+          <span>Year</span>
+          <input value={lot.homeYear ?? ""} onChange={(e) => onChange({ homeYear: e.target.value })} />
+        </label>
+        <label>
+          <span>Make</span>
+          <input value={lot.homeMake ?? ""} onChange={(e) => onChange({ homeMake: e.target.value })} />
+        </label>
+      </div>
+      <label className="wiring-field">
+        <span>Model</span>
+        <input value={lot.homeModel ?? ""} onChange={(e) => onChange({ homeModel: e.target.value })} />
+      </label>
+      <div className="pet-row">
+        <label>
+          <span>Width</span>
+          <input value={lot.homeWidth ?? ""} onChange={(e) => onChange({ homeWidth: e.target.value })} />
+        </label>
+        <label>
+          <span>Length</span>
+          <input value={lot.homeLength ?? ""} onChange={(e) => onChange({ homeLength: e.target.value })} />
+        </label>
+      </div>
+      <label className="wiring-field">
+        <span>Type</span>
+        <select className="mow-select" value={wide} onChange={(e) => onChange({ homeWide: e.target.value })}>
+          <option value="">—</option>
+          <option>Single Wide</option>
+          <option>Double Wide</option>
+        </select>
+      </label>
+    </div>
+  );
+}
+
+function listingHref(url: string) {
+  const trimmed = url.trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+function EmptyLotChecklist({ lot, onChange }: { lot: Lot; onChange: (next: Partial<Lot>) => void }) {
+  const href = listingHref(lot.zillowUrl ?? "");
+  const checks = [
+    ["readyPower", "Power on"],
+    ["readyClean", "Cleaned"],
+    ["readyInspected", "Inspected"],
+  ] as const;
+  return (
+    <div className="pet-block">
+      <p className="pet-title">Empty lot</p>
+      <ul className="inventory">
+        {checks.map(([key, label]) => (
+          <li key={key}>
+            <label>
+              <input
+                type="checkbox"
+                checked={lot[key] === "Yes"}
+                onChange={(e) => onChange({ [key]: e.target.checked ? "Yes" : "" })}
+              />
+              {label}
+            </label>
+          </li>
+        ))}
+      </ul>
+      <label className="wiring-field">
+        <span>Listed on Zillow</span>
+        <select
+          className="mow-select"
+          value={lot.zillow === "Yes" || lot.zillow === "No" ? lot.zillow : ""}
+          onChange={(e) => onChange({ zillow: e.target.value })}
+        >
+          <option value="">—</option>
+          <option>Yes</option>
+          <option>No</option>
+        </select>
+      </label>
+      <label className="wiring-field">
+        <span>Listing link</span>
+        <input value={lot.zillowUrl ?? ""} placeholder="https://www.zillow.com/..." onChange={(e) => onChange({ zillowUrl: e.target.value })} />
+      </label>
+      <a className={`filter listing-link${href ? "" : " is-off"}`} href={href || undefined} target="_blank" rel="noreferrer">
+        Open listing
+      </a>
+    </div>
+  );
+}
+
+function HomeInsuranceFields({ lot, onChange, split }: { lot: Lot; onChange: (next: Partial<Lot>) => void; split?: string }) {
+  const value = lot.homeIns === "Yes" || lot.homeIns === "No" ? lot.homeIns : "";
+  return (
+    <>
+      <label className="wiring-field">
+        <span>Home insurance</span>
+        <select className="mow-select" value={value} onChange={(e) => onChange({ homeIns: e.target.value })}>
+          <option value="">—</option>
+          <option>Yes</option>
+          <option>No</option>
+        </select>
+      </label>
+      <label className="wiring-field">
+        <span>Yearly insurance cost</span>
+        <input value={split ?? ""} readOnly />
+      </label>
+      <label className="wiring-field">
+        <span>Expires</span>
+        <input type="date" value={lot.homeInsDate ?? ""} onChange={(e) => onChange({ homeInsDate: e.target.value })} />
+      </label>
+    </>
+  );
+}
+
+function stayRows(stay: Stay): [string, string][] {
+  const rows: [string, string][] = [
+    ["Phone", stay.phone],
+    ["Email", stay.email ?? ""],
+    ["Renter", stay.renter],
+    ["Rent", stay.rent],
+    ["Late rent", stay.lateRent ?? ""],
+    ["Bounced check", stay.bouncedCheck ?? ""],
+    ["Moved in", stay.moveIn],
+    ["Moved out", stay.moveOut],
+    ["Lease end", stay.leaseEnd ?? ""],
+    ["Rent due", stay.rentDue ?? ""],
+    ["Deposit", stay.deposit ?? ""],
+    ["Still owed", stay.balance],
+    ["Guest", [stay.guest, ...(stay.guests ?? []).map((guest) => guest.name)].filter(Boolean).join(" · ")],
+    ["Vehicle", stay.vehicle ?? ""],
+    ["Dogs", stay.dogs ?? ""],
+    ["Cats", stay.cats ?? ""],
+    ["Emergency", [stay.emergencyName, stay.emergencyPhone].filter(Boolean).join(" · ")],
+    ["Notice", [stay.noticeDate, stay.noticeNote].filter(Boolean).join(" · ")],
+    ["Court", [stay.courtDate, stay.courtNote].filter(Boolean).join(" · ")],
+    ["Insurance", [stay.homeIns, stay.homeInsDate].filter(Boolean).join(" · ")],
+    ["Issues", stay.issues ?? ""],
+    ["Violations", stay.violations ?? ""],
+  ];
+  return rows.filter(([, value]) => value.trim());
+}
+
+function PreviousTenants({ values, onChange }: { values: Lot; onChange: (next: Partial<Lot>) => void }) {
+  const [opened, setOpened] = useState<number | null>(null);
+  const history = values.history ?? [];
+  if (history.length === 0) return null;
+  return (
+    <div className="pet-block">
+      <p className="pet-title">{history.length === 1 ? "Previous tenant" : "Previous tenants"}</p>
+      <ul className="history">
+        {history.map((stay, index) => {
+          const reminder = depositReminder(stay);
+          const docs = [stay.lease, stay.rulesReceipt, stay.background, stay.noticeFile, ...(stay.otherDocs ?? [])].filter(
+            (file): file is { name: string; data: string } => Boolean(file?.data),
+          );
+          const open = opened === index;
+          return (
+            <li key={`${stay.moveOut}-${stay.name}-${index}`}>
+              <button className="stay-line" type="button" aria-expanded={open} onClick={() => setOpened(open ? null : index)}>
+                <strong>{stay.name || "No name"}</strong>
+                <span>{shortDay(stay.moveOut)}</span>
+                <span>{stay.balance?.trim() || "—"}</span>
+              </button>
+              {open ? (
+                <>
+                  <dl className="stay-facts">
+                    {stayRows(stay).map(([label, value]) => (
+                      <div key={label}>
+                        <dt>{label}</dt>
+                        <dd>{value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                  {docs.length > 0 ? (
+                    <div className="doc-list">
+                      {docs.map((file, fileIndex) => (
+                        <a key={`${file.name}-${fileIndex}`} href={file.data} download={file.name}>
+                          {file.name}
+                        </a>
+                      ))}
+                    </div>
+                  ) : null}
+                  {reminder ? <span className="deposit-alert">{reminder}</span> : null}
+                  {stay.depositChoice ? <span>Deposit {stay.depositChoice === "Return" ? "returned" : "kept"}</span> : null}
+                  {stay.depositDue && !stay.depositChoice ? (
+                    <div className="deposit-actions">
+                      <button
+                        className="filter"
+                        type="button"
+                        onClick={() =>
+                          onChange({
+                            history: history.map((item, i) => (i === index ? { ...item, depositChoice: "Return" } : item)),
+                          })
+                        }
+                      >
+                        Return deposit
+                      </button>
+                      <button
+                        className="filter"
+                        type="button"
+                        onClick={() =>
+                          onChange({
+                            history: history.map((item, i) => (i === index ? { ...item, depositChoice: "Keep" } : item)),
+                          })
+                        }
+                      >
+                        Keep deposit
+                      </button>
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function updateJob(jobs: MaintJob[] | undefined, id: string, patch: Partial<MaintJob>) {
+  return (jobs ?? []).map((job) => (job.id === id ? { ...job, ...patch } : job));
+}
+
+function sortedJobs(jobs: MaintJob[] | undefined) {
+  return [...(jobs ?? [])].sort((a, b) => {
+    const doneA = a.done === "Yes" ? 1 : 0;
+    const doneB = b.done === "Yes" ? 1 : 0;
+    if (doneA !== doneB) return doneA - doneB;
+    return (b.date || "").localeCompare(a.date || "");
+  });
+}
+
+function shortDay(value?: string) {
+  const day = parseDay(value);
+  if (!day) return value?.trim() || "—";
+  const [y, m, d] = day.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function Fold({ title, children }: { title: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="pet-block">
+      <button className="fold" type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+        {open ? "▾" : "▸"} {title}
+      </button>
+      {open ? children : null}
+    </div>
+  );
+}
+
+function printMow(lots: Lot[]) {
+  const win = window.open("", "_blank");
+  if (!win) return;
+  const rows = lots
+    .filter((lot) => lot.noMow === "Yes")
+    .map((lot) => ({ street: lot.street, lot: lot.lot, address: [lot.address, lot.street].filter(Boolean).join(" "), name: displayName(lot) }));
+  const body = groupTodos(rows)
+    .map(([street, group]) => {
+      const lines = group.items
+        .map((item) => `<tr><td>${escapeHtml(item.lot || "—")}</td><td>${escapeHtml(item.address)}</td><td>${escapeHtml(item.name)}</td></tr>`)
+        .join("");
+      return `<h2>${escapeHtml(street)}</h2><table><thead><tr><th>Lot</th><th>Address</th><th>Name</th></tr></thead><tbody>${lines}</tbody></table>`;
+    })
+    .join("");
+  win.document.open();
+  win.document.write(`<!doctype html><html><head><title>Mow list</title><style>
+    @page { size: letter; margin: 0.6in; }
+    body { margin: 0; color: #1c1916; font: 14px/1.4 Georgia, serif; }
+    h1, h2 { letter-spacing: 0.08em; text-transform: uppercase; }
+    h1 { font-size: 16px; margin: 0 0 12px; }
+    h2 { font-size: 13px; margin: 18px 0 6px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid #ddd; }
+  </style></head><body><h1>Mow list</h1>${body || "<p>No lots are set to Yes.</p>"}</body></html>`);
+  win.document.close();
+  const go = () => {
+    if (win.closed) return;
+    win.focus();
+    win.print();
+  };
+  win.onload = () => setTimeout(go, 200);
+  setTimeout(go, 500);
+}
+
+const MOW_ROUNDS_KEY = "magnolia-mow-rounds";
+
+type MowStop = { id: string; lot: string; address: string; name: string; street: string; mowed: boolean; notes: string };
+type MowRound = { id: string; date: string; stops: MowStop[] };
+
+function mowStops(lots: Lot[]): MowStop[] {
+  return lots
+    .filter((lot) => lot.noMow === "Yes")
+    .map((lot) => ({
+      id: lot.id,
+      street: lot.street,
+      lot: lot.lot,
+      address: [lot.address, lot.street].filter(Boolean).join(" "),
+      name: displayName(lot),
+      mowed: false,
+      notes: "",
+    }));
+}
+
+function mowTone(stop: MowStop, balance: number) {
+  if (balance > 72) return "mow-red";
+  if (stop.notes.trim()) return "mow-yellow";
+  if (stop.mowed) return "mow-green";
+  return "mow-orange";
+}
+
+function asRounds(value: unknown): MowRound[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as Partial<MowRound>;
+    if (typeof row.date !== "string" || !Array.isArray(row.stops)) return [];
+    return [{ id: typeof row.id === "string" ? row.id : row.date, date: row.date, stops: row.stops.filter((stop) => stop && typeof stop.id === "string") as MowStop[] }];
+  });
+}
+
+function MowBoard({ lots, onOpen }: { lots: Lot[]; onOpen: (id: string) => void }) {
+  const [rounds, setRounds] = useState<MowRound[]>([]);
+  const [draft, setDraft] = useState<MowRound | null>(null);
+  const [cursor, setCursor] = useState<number | null>(null);
+  const [ready, setReady] = useState(false);
+  const balance = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const lot of lots) map.set(lot.id, moneyNumber(lot.balance ?? ""));
+    return map;
+  }, [lots]);
+
+  useEffect(() => {
+    let cancel = false;
+    void readMaster()
+      .then((book) => {
+        if (cancel) return;
+        const saved = asRounds(book?.mowings);
+        if (saved.length) setRounds(saved);
+        else {
+          try {
+            const local = asRounds(JSON.parse(localStorage.getItem(MOW_ROUNDS_KEY) ?? "[]"));
+            if (local.length) setRounds(local);
+          } catch {
+            /* start with no saved mowings */
+          }
+        }
+      })
+      .catch(() => {
+        /* the list still works */
+      })
+      .finally(() => {
+        if (!cancel) setReady(true);
+      });
+    return () => {
+      cancel = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ready || !rounds.length) return;
+    try {
+      localStorage.setItem(MOW_ROUNDS_KEY, JSON.stringify(rounds));
+    } catch {
+      /* the round stays on screen */
+    }
+    void saveMowings({ data: { mowings: rounds } }).catch(() => {
+      /* the browser copy is still there */
+    });
+  }, [rounds, ready]);
+
+  const viewing = cursor === null ? draft : rounds[cursor] ?? null;
+  const editing = cursor === null && draft !== null;
+  const rows = viewing?.stops ?? mowStops(lots);
+  const groups = groupTodos(rows);
+  const canLeft = (cursor === null && rounds.length > 0) || (cursor !== null && cursor < rounds.length - 1);
+  const canRight = cursor !== null && cursor > 0;
+
+  function startMowing() {
+    if (draft) {
+      setCursor(null);
+      return;
+    }
+    const today = new Date();
+    const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    setDraft({ id: `mow-${Date.now()}`, date, stops: mowStops(lots) });
+    setCursor(null);
+  }
+
+  function patchStop(id: string, patch: Partial<MowStop>) {
+    setDraft((current) => (current ? { ...current, stops: current.stops.map((stop) => (stop.id === id ? { ...stop, ...patch } : stop)) } : current));
+  }
+
+  function submitMowing() {
+    if (!draft?.date) return;
+    setRounds((current) => [draft, ...current]);
+    setDraft(null);
+    setCursor(0);
+  }
+
+  return (
+    <div className="todo">
+      <div className="todo-head">
+        <h2>Yes mow</h2>
+        {canLeft || canRight ? (
+          <div className="mow-nav">
+            {canLeft ? <button type="button" className="print-map" aria-label="Older mowing" onClick={() => setCursor(cursor === null ? 0 : cursor + 1)}>‹</button> : null}
+            {canRight ? <button type="button" className="print-map" aria-label="Newer mowing" onClick={() => setCursor((cursor ?? 0) - 1)}>›</button> : null}
+          </div>
+        ) : null}
+        {editing ? (
+          <label className="mow-date">
+            Mowing date
+            <input type="date" value={draft.date} onChange={(event) => setDraft({ ...draft, date: event.target.value })} />
+          </label>
+        ) : viewing ? (
+          <p className="mow-label">{viewing.date}</p>
+        ) : null}
+        <button className="print-map" type="button" onClick={() => printMow(lots)}>
+          Print
+        </button>
+        {editing ? (
+          <button className="print-map" type="button" disabled={!draft.date} onClick={submitMowing}>
+            Submit
+          </button>
+        ) : null}
+        <button className="print-map mow-new" type="button" onClick={startMowing}>
+          New Mowing
+        </button>
+      </div>
+      {rows.length === 0 ? (
+        <p className="todo-empty">No lots are set to Yes.</p>
+      ) : (
+        groups.map(([street, group]) => (
+          <section key={street}>
+            <h3>{street}</h3>
+            <ul className="mow-list">
+              {group.items.map((item) => {
+                const tone = viewing ? mowTone(item, balance.get(item.id) ?? 0) : "";
+                return (
+                  <li key={item.id} className={editing || viewing ? "mow-active" : ""}>
+                    <button className={"todo-card " + tone} type="button" onClick={() => onOpen(item.id)}>
+                      <span><b>Lot</b> {item.lot || "—"}</span>
+                      <span><b>Address</b> {item.address || "—"}</span>
+                      <span><b>Name</b> {item.name || "—"}</span>
+                    </button>
+                    {viewing ? (
+                      <div className="mow-side">
+                        <label>
+                          <input type="checkbox" checked={item.mowed} disabled={!editing} onChange={(event) => patchStop(item.id, { mowed: event.target.checked })} />
+                          Mowed
+                        </label>
+                        <input aria-label={"Notes for " + (item.name || item.lot)} value={item.notes} placeholder="Notes" readOnly={!editing} onChange={(event) => patchStop(item.id, { notes: event.target.value })} />
+                      </div>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        ))
+      )}
+    </div>
+  );
+}
+
+function streetGroup(street: string) {
+  const name = street.toLowerCase();
+  if (name.includes("jaleen")) return { rank: 0, label: "Jaleen" };
+  if (name.includes("denise")) return { rank: 1, label: "Denise" };
+  if (name.includes("leon")) return { rank: 2, label: "Leon" };
+  if (name.includes("michelle")) return { rank: 3, label: "Michelle" };
+  if (name.includes("kirkwood")) return { rank: 4, label: "Kirkwood" };
+  return { rank: 5, label: street.trim() || "Other" };
+}
+
+const NOTE_BANDS = [
+  { label: "Rent, short, or owe", words: ["rent", "short", "owe"] },
+  { label: "Check, bounced, or missing", words: ["check", "bounced", "missing"] },
+  { label: "Title or guest", words: ["title", "guest"] },
+  { label: "Dog, cat, or pet", words: ["dog", "cat", "pet"] },
+] as const;
+
+function noteBand(notes: string) {
+  const hay = notes.toLowerCase();
+  const hit = NOTE_BANDS.find((band) => band.words.some((word) => new RegExp(`\\b${word}`, "i").test(hay)));
+  return hit?.label ?? "Other";
+}
+
+function noteBands<T extends { notes: string }>(items: T[]) {
+  const groups = new Map<string, T[]>();
+  for (const item of items) {
+    const label = noteBand(item.notes);
+    const current = groups.get(label);
+    if (current) current.push(item);
+    else groups.set(label, [item]);
+  }
+  const order = [...NOTE_BANDS.map((band) => band.label), "Other"];
+  return order.flatMap((label) => {
+    const group = groups.get(label);
+    return group?.length ? [[label, group] as const] : [];
+  });
+}
+
+function groupTodos<T extends { street: string }>(items: T[]) {
+  const groups = new Map<string, { rank: number; items: T[] }>();
+  for (const item of items) {
+    const group = streetGroup(item.street);
+    const current = groups.get(group.label);
+    if (current) current.items.push(item);
+    else groups.set(group.label, { rank: group.rank, items: [item] });
+  }
+  return [...groups.entries()].sort((a, b) => a[1].rank - b[1].rank || a[0].localeCompare(b[0]));
+}
+function TodoBoard({ lots, onOpen, onSave }: { lots: Lot[]; onOpen: (id: string) => void; onSave?: (lot: Lot) => void }) {
+  const [board, setBoard] = useState<BoardNote[]>(() => (typeof window === "undefined" ? [] : loadBoard()));
+  useEffect(() => {
+    const refresh = () => setBoard(loadBoard());
+    refresh();
+    window.addEventListener("focus", refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, []);
+  const items = useMemo(() => {
+    const base = buildTodo(lots);
+    const have = new Set(base.map((item) => item.id));
+    const extra = board
+      .filter((note) => (note.kind === "sticky" || note.kind === "pin") && note.text.trim() && (!note.pin || note.pin === "board:meeting"))
+      .map((note) => ({
+        id: `board-${note.id}`,
+        lot: "",
+        address: "",
+        street: "",
+        name: "Meeting",
+        notes: note.text,
+        text: "Sticky note",
+        date: "",
+      }));
+    return [...base, ...vendorTodoItems(), ...extra.filter((item) => !have.has(item.id))];
+  }, [lots, board]);
+  const stickies = useMemo(() => {
+    const map: Record<string, { id: string; text: string; color: string }[]> = {};
+    const add = (id: string, sticky: { id: string; text: string; color: string }) => {
+      const list = map[id] ?? [];
+      if (list.some((item) => item.id === sticky.id || item.text.trim().toLowerCase() === sticky.text.trim().toLowerCase())) return;
+      map[id] = [...list, sticky];
+    };
+    for (const lot of lots) {
+      for (const sticky of lot.stickies ?? []) add(lot.id, sticky);
+    }
+    for (const note of board) {
+      if (note.kind !== "pin" || !note.pin) continue;
+      const lotId = note.pin.startsWith("todo:") ? note.pin.slice(5) : note.pin.startsWith("lot:") ? note.pin.slice(4) : "";
+      if (lotId) add(lotId, { id: note.id, text: note.text, color: note.color });
+      if (!note.pin || note.pin === "board:meeting") add(`board-${note.id}`, { id: note.id, text: note.text, color: note.color });
+    }
+    return map;
+  }, [lots, board]);
+  const [done, setDone] = useState<Set<string>>(() => new Set());
+  const [rank, setRank] = useState<Record<string, number>>({});
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(TODO_DONE_KEY);
+      const ids = raw ? (JSON.parse(raw) as unknown) : [];
+      if (Array.isArray(ids)) setDone(new Set(ids.filter((id) => typeof id === "string")));
+    } catch {
+      setDone(new Set());
+    }
+    try {
+      const raw = localStorage.getItem(TODO_RANK_KEY);
+      const saved = raw ? (JSON.parse(raw) as unknown) : {};
+      if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+        const next: Record<string, number> = {};
+        for (const [id, value] of Object.entries(saved)) {
+          if (typeof value === "number") next[id] = value;
+        }
+        setRank(next);
+      }
+    } catch {
+      setRank({});
+    }
+  }, []);
+  function toggle(id: string) {
+    const checking = !done.has(id);
+    const next = new Set(done);
+    if (checking) next.add(id);
+    else next.delete(id);
+    localStorage.setItem(TODO_DONE_KEY, JSON.stringify([...next]));
+    setDone(next);
+    if (!checking) return;
+    const current = items.find((item) => item.id === id);
+    if (!current) return;
+    const label = noteBand(current.notes);
+    const bandItems = items.filter((item) => noteBand(item.notes) === label);
+    const index = bandItems.findIndex((item) => item.id === id);
+    const follow = [...bandItems.slice(index + 1), ...bandItems.slice(0, index)].find((item) => !next.has(item.id));
+    if (follow) onOpen(follow.id);
+  }
+  function shift(id: string, dir: -1 | 1, list: { id: string }[]) {
+    const index = list.findIndex((item) => item.id === id);
+    const other = index + dir;
+    if (index < 0 || other < 0 || other >= list.length) return;
+    setRank((prev) => {
+      const next = { ...prev };
+      list.forEach((item, i) => {
+        if (typeof next[item.id] !== "number") next[item.id] = list.length - i;
+      });
+      const a = list[index].id;
+      const b = list[other].id;
+      const hold = next[a];
+      next[a] = next[b];
+      next[b] = hold;
+      if (next[a] === next[b]) next[a] = next[b] + (dir < 0 ? 1 : -1);
+      localStorage.setItem(TODO_RANK_KEY, JSON.stringify(next));
+      return next;
+    });
+  }
+  const openItems = items.filter((item) => !done.has(item.id));
+  const doneItems = [...items.filter((item) => done.has(item.id))].sort((a, b) => (rank[b.id] ?? 0) - (rank[a.id] ?? 0));
+  const shown = [...openItems].sort((a, b) => (rank[b.id] ?? 0) - (rank[a.id] ?? 0));
+  return (
+    <div className="todo">
+      <div className="todo-head">
+        <h2>By notes</h2>
+        <div className="seg">
+          <button className="filter" type="button" aria-pressed>
+            Open{openItems.length ? ` ${openItems.length}` : ""}
+          </button>
+          <button className="filter" type="button" aria-pressed={false} onClick={() => document.getElementById("todo-completed")?.scrollIntoView({ behavior: "smooth", block: "start" })}>
+            Done{doneItems.length ? ` ${doneItems.length}` : ""}
+          </button>
+        </div>
+        <button className="print-map" type="button" onClick={() => printTodo([...shown, ...doneItems].map((item) => ({ ...item, done: done.has(item.id) })))}>
+          Print
+        </button>
+      </div>
+      <PasswordResets lots={lots} onSave={onSave} />
+      {lots.some((lot) => lot.residentRequest) ? (
+        <section>
+          <h3>Approve resident changes</h3>
+          <div className="resident-links">
+            {lots.filter((lot) => lot.residentRequest).map((lot) => (
+              <article key={lot.id} className="resident-link">
+                <div>
+                  <strong>Lot {lot.lot} · {lot.address} {lot.street}</strong>
+                  <small>{lot.residentRequest?.name || "Name"} · {lot.residentRequest?.phone || "Phone"} · {lot.residentRequest?.email || "Email"}</small>
+                </div>
+                <button type="button" className="business-primary" onClick={() => onOpen(lot.id)}>Review</button>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {lots.some((lot) => lot.managerRequest) ? (
+        <section>
+          <h3>Approve manager changes</h3>
+          <div className="resident-links">
+            {lots.filter((lot) => lot.managerRequest).map((lot) => (
+              <article key={lot.id} className="resident-link">
+                <div>
+                  <strong>Lot {lot.lot} · {lot.address} {lot.street}</strong>
+                  <small>{Object.keys(lot.managerRequest?.patch ?? {}).slice(0, 4).join(", ") || "Change"}</small>
+                </div>
+                <button type="button" className="business-primary" onClick={() => onOpen(lot.id)}>Review</button>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      <HoaBoard />
+      {shown.length === 0 ? null : (
+        noteBands(shown).map(([label, group]) => (
+          <section key={label}>
+            <h3>{label}</h3>
+            <TodoList items={group} done={done} onToggle={toggle} onShift={(id, dir) => shift(id, dir, group)} onOpen={onOpen} empty="" stickies={stickies} />
+          </section>
+        ))
+      )}
+      {doneItems.length ? (
+        <section id="todo-completed" className="todo-completed">
+          <h3>Completed</h3>
+          <TodoList items={doneItems} done={done} onToggle={toggle} onShift={(id, dir) => shift(id, dir, doneItems)} onOpen={onOpen} empty="" stickies={stickies} />
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function shownAmount(value?: string) {
+  const raw = value?.trim() ?? "";
+  if (!raw) return "";
+  return raw.startsWith("$") ? raw : `$${raw}`;
+}
+
+function increaseLines(lot: Lot) {
+  return [
+    lot.rentInc2026?.trim() ? `08/2026 rent increase: ${shownAmount(lot.rentInc2026)}` : "",
+    lot.rentInc2027?.trim() ? `08/2027 rent increase: ${shownAmount(lot.rentInc2027)}` : "",
+  ].filter(Boolean);
+}
+
+function increaseBody(lot: Lot) {
+  const who = displayName(lot) || "Resident";
+  return `Hello ${who},\n\nThis is notice of a rent increase for ${[lot.address, lot.street].filter(Boolean).join(" ")}, lot ${lot.lot}.\n\n${increaseLines(lot).join("\n")}\n\nMagnolia Central of Florida Estates`;
+}
+
+function openMail(to: string, subject: string, body: string) {
+  window.open(`mailto:${to}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, "_blank");
+}
+
+function openMailAll(emails: string[], subject: string, body: string) {
+  const list = [...new Set(emails.map((item) => item.trim()).filter(Boolean))];
+  if (list.length === 0) return;
+  window.open(`mailto:?bcc=${encodeURIComponent(list.join(","))}&subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, "_blank");
+}
+
+function openText(phone: string, body: string) {
+  const digits = phone.replace(/[^\d]/g, "");
+  if (!digits) return;
+  window.open(`sms:${digits}?&body=${encodeURIComponent(body)}`, "_blank");
+}
+
+function openTextAll(phones: string[], body: string) {
+  const list = [...new Set(phones.map((item) => item.replace(/[^\d]/g, "")).filter(Boolean))];
+  if (list.length === 0) return;
+  window.open(`sms:${list.join(",")}?&body=${encodeURIComponent(body)}`, "_blank");
+}
+
+function rollGroups(lots: Lot[]) {
+  const sorted = [...lots].sort(byStreetAddress);
+  const groups = new Map<string, { rank: number; items: Lot[] }>();
+  for (const lot of sorted) {
+    const group = streetGroup(lot.street);
+    const current = groups.get(group.label);
+    if (current) current.items.push(lot);
+    else groups.set(group.label, { rank: group.rank, items: [lot] });
+  }
+  return [...groups.entries()].sort((a, b) => a[1].rank - b[1].rank || a[0].localeCompare(b[0]));
+}
+
+function IncreaseBoard({ lots, onOpen }: { lots: Lot[]; onOpen: (id: string) => void }) {
+  const rows = lots.filter((lot) => lot.rentInc2026?.trim() || lot.rentInc2027?.trim());
+  const emails = rows.map((lot) => lot.email).filter((email) => email.trim());
+  function mailOne(lot: Lot) {
+    if (!lot.email.trim()) return;
+    openMail(lot.email.trim(), `Rent increase · Lot ${lot.lot}`, increaseBody(lot));
+  }
+  function mailEach() {
+    rows.forEach(mailOne);
+  }
+  function mailAll() {
+    openMailAll(
+      emails,
+      "Rent increase · Magnolia Central of Florida Estates",
+      "Hello,\n\nThis is notice of a rent increase from Magnolia Central of Florida Estates. Your 08/2026 and 08/2027 amounts are the figures on file for your lot.\n\nMagnolia Central of Florida Estates",
+    );
+  }
+  return (
+    <div className="todo roll">
+      <div className="todo-head">
+        <h2>Rent increase</h2>
+        <button className="print-map" type="button" disabled={emails.length === 0} onClick={mailEach}>
+          Email each
+        </button>
+        <button className="print-map" type="button" disabled={emails.length === 0} onClick={mailAll}>
+          Email all
+        </button>
+      </div>
+      {rows.length === 0 ? (
+        <p className="todo-empty">Enter an 08/2026 or 08/2027 amount in the register, then open this roll again.</p>
+      ) : (
+        rollGroups(rows).map(([street, group]) => (
+          <section key={street}>
+            <h3>{street}</h3>
+            <ul>
+              {group.items.map((lot) => (
+                <li key={lot.id} className="roll-row">
+                  <button className="todo-card" type="button" onClick={() => onOpen(lot.id)}>
+                    <span><b>Lot</b> {lot.lot}</span>
+                    <span><b>Address</b> {[lot.address, lot.street].filter(Boolean).join(" ")}</span>
+                    <span><b>Name</b> {displayName(lot) || "—"}</span>
+                    {lot.rentInc2026?.trim() ? <span><b>08/2026</b> {shownAmount(lot.rentInc2026)}</span> : null}
+                    {lot.rentInc2027?.trim() ? <span><b>08/2027</b> {shownAmount(lot.rentInc2027)}</span> : null}
+                  </button>
+                  <button className="print-map" type="button" disabled={!lot.email.trim()} onClick={() => mailOne(lot)}>
+                    Email
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ))
+      )}
+    </div>
+  );
+}
+
+const ALERTS = [
+  ["water", "Water outage", "The water is out at Magnolia Central of Florida Estates. We will let you know when it is back on."],
+  ["storm", "Storm", "A storm is in the area. Please secure anything loose outside and stay inside until it passes."],
+  ["power", "Power outage", "The power is out at Magnolia Central of Florida Estates. We will let you know when it is back on."],
+  ["other", "Other", ""],
+] as const;
+
+function AlertBoard({ lots, onOpen }: { lots: Lot[]; onOpen: (id: string) => void }) {
+  const [reason, setReason] = useState<(typeof ALERTS)[number][0]>("water");
+  const [other, setOther] = useState("");
+  const picked = ALERTS.find((item) => item[0] === reason) ?? ALERTS[0];
+  const message = reason === "other" ? other.trim() : picked[2];
+  const rows = lots.filter((lot) => lot.status === "Occupied" || lot.status === "Eviction");
+  const bodyFor = (lot: Lot) => `Hello ${displayName(lot) || "Resident"},\n\n${message || "Please see this notice from the park."}\n\n${[lot.address, lot.street].filter(Boolean).join(" ")}, lot ${lot.lot}\n\nMagnolia Central of Florida Estates`;
+  const emails = rows.map((lot) => lot.email).filter((email) => email.trim());
+  const phones = rows.map((lot) => lot.phone).filter((phone) => phone.replace(/[^\d]/g, ""));
+  return (
+    <div className="todo roll">
+      <div className="todo-head">
+        <h2>Emergency broadcast</h2>
+        <select className="mow-select" value={reason} onChange={(e) => setReason(e.target.value as (typeof ALERTS)[number][0])}>
+          {ALERTS.map(([id, label]) => (
+            <option key={id} value={id}>
+              {label}
+            </option>
+          ))}
+        </select>
+        <button className="print-map" type="button" disabled={!message || emails.length === 0} onClick={() => { postResidentBroadcast(picked[1], message); rows.forEach((lot) => lot.email.trim() && openMail(lot.email.trim(), picked[1], bodyFor(lot))); }}>
+          Email each
+        </button>
+        <button className="print-map" type="button" disabled={!message || emails.length === 0} onClick={() => { postResidentBroadcast(picked[1], message); openMailAll(emails, picked[1], `${message}\n\nMagnolia Central of Florida Estates`); }}>
+          Email all
+        </button>
+        <button className="print-map" type="button" disabled={!message || phones.length === 0} onClick={() => { postResidentBroadcast(picked[1], message); rows.forEach((lot) => openText(lot.phone, message)); }}>
+          Text each
+        </button>
+        <button className="print-map" type="button" disabled={!message || phones.length === 0} onClick={() => { postResidentBroadcast(picked[1], message); openTextAll(phones, message); }}>
+          Text all
+        </button>
+      </div>
+      {reason === "other" ? (
+        <label className="wiring-field roll-note">
+          <span>Other notice</span>
+          <textarea rows={3} value={other} onChange={(e) => setOther(e.target.value)} placeholder="What should the message say?" />
+        </label>
+      ) : (
+        <p className="roll-note">{picked[2]} This posts on the residents meeting board only.</p>
+      )}
+      {rollGroups(rows).map(([street, group]) => (
+        <section key={street}>
+          <h3>{street}</h3>
+          <ul>
+            {group.items.map((lot) => (
+              <li key={lot.id} className="roll-row">
+                <button className="todo-card" type="button" onClick={() => onOpen(lot.id)}>
+                  <span><b>Lot</b> {lot.lot}</span>
+                  <span><b>Address</b> {[lot.address, lot.street].filter(Boolean).join(" ")}</span>
+                  <span><b>Name</b> {displayName(lot) || "—"}</span>
+                  <span><b>Email</b> {lot.email.trim() || "—"}</span>
+                  <span><b>Phone</b> {lot.phone.trim() || "—"}</span>
+                </button>
+                <div className="roll-actions">
+                  <button className="print-map" type="button" disabled={!message || !lot.email.trim()} onClick={() => openMail(lot.email.trim(), picked[1], bodyFor(lot))}>
+                    Email
+                  </button>
+                  <button className="print-map" type="button" disabled={!message || !lot.phone.replace(/[^\d]/g, "")} onClick={() => openText(lot.phone, message)}>
+                    Text
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function costSum(values: (string | undefined)[]) {
+  if (values.every((value) => !(value ?? "").trim())) return "";
+  const sum = values.reduce((total, value) => total + (parseMoney(value) ?? 0), 0);
+  const rounded = Math.round(sum * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
+}
+
+function parseMoney(value?: string): number | null {
+  const raw = (value ?? "").replace(/[$,\s]/g, "");
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function dollar(amount: number) {
+  return amount.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: Number.isInteger(amount) ? 0 : 2 });
+}
+
+const HEAT_STOPS: { min: number; color: string; label: string }[] = [
+  { min: 86, color: "#0d7a32", label: "Highest · top" },
+  { min: 72, color: "#2f9e44", label: "High" },
+  { min: 58, color: "#8fce4a", label: "Above average" },
+  { min: 43, color: "#f2d031", label: "Moderate" },
+  { min: 29, color: "#f08c00", label: "Below average" },
+  { min: 15, color: "#e8590c", label: "Low" },
+  { min: -Infinity, color: "#c92a2a", label: "Lowest · bottom" },
+];
+
+function heatBand(percent: number) {
+  return HEAT_STOPS.find((stop) => percent >= stop.min) ?? HEAT_STOPS[HEAT_STOPS.length - 1];
+}
+
+function heatInk(hex: string) {
+  const r = Number.parseInt(hex.slice(1, 3), 16);
+  const g = Number.parseInt(hex.slice(3, 5), 16);
+  const b = Number.parseInt(hex.slice(5, 7), 16);
+  return r * 0.3 + g * 0.59 + b * 0.11 > 150 ? "#1c1916" : "#fff";
+}
+
+const HEAT_METRICS = [
+  ["overall", "Overall"],
+  ["roi", "Percentile"],
+  ["monthProfit", "Monthly profit"],
+  ["yearProfit", "Yearly profit"],
+  ["monthExpense", "Monthly expenses"],
+  ["yearExpense", "Yearly expenses"],
+  ["monthRent", "Monthly rent"],
+  ["yearRent", "Yearly rent"],
+  ["owed", "Still owed"],
+] as const;
+
+type HeatMetric = (typeof HEAT_METRICS)[number][0];
+
+function HeatBoard({ lots, scoped, selected, onOpen, mini = false, dropLot = "", stickyIds }: { lots: Lot[]; scoped: Lot[]; selected: string | null; onOpen: (id: string) => void; mini?: boolean; dropLot?: string; stickyIds?: ReadonlySet<string> }) {
+  const [metric, setMetric] = useState<HeatMetric>("overall");
+  const [metricsOpen, setMetricsOpen] = useState(false);
+  const [lotFilters, setLotFilters] = useState<LotFilter[]>([]);
+  const [lotsOpen, setLotsOpen] = useState(false);
+  const lotFilterNames = [
+    ["empty", "Empty"],
+    ["occupied", "Occupied"],
+    ["issues", "Issues"],
+    ["renters", "Renters"],
+    ["owners", "Owners"],
+    ["due", "Rent due"],
+    ["roof", "Needs roof"],
+  ] as const;
+  const homes = lots.filter((lot) => lot.status !== "Open");
+  const insuredHomes = homes.filter((lot) => lot.homeIns === "Yes");
+  const poolDefaults = {
+    insurance: "7000",
+    propertyTax: "30000",
+    sewer: "30000",
+    water: "30000",
+    garbage: "30000",
+    wiring: "0",
+    materials: "0",
+    maintenance: "0",
+    utilities: "0",
+    other: "0",
+  };
+  const [poolsOpen, setPoolsOpen] = useState(false);
+  const [expensePools, setExpensePools] = useState<Record<keyof typeof poolDefaults, string>>(() => {
+    try {
+      const saved = typeof window !== "undefined" ? localStorage.getItem("magnolia-financial-expense-pools") : null;
+      return saved ? { ...poolDefaults, ...JSON.parse(saved) } : poolDefaults;
+    } catch {
+      return poolDefaults;
+    }
+  });
+  const updateExpensePool = (key: keyof typeof poolDefaults, value: string) => {
+    const next = { ...expensePools, [key]: value };
+    setExpensePools(next);
+    try {
+      localStorage.setItem("magnolia-financial-expense-pools", JSON.stringify(next));
+    } catch {
+      /* keep the values in the current session if browser storage is unavailable */
+    }
+  };
+  const poolLabels: { key: keyof typeof poolDefaults; label: string }[] = [
+    { key: "insurance", label: "Home insurance" },
+    { key: "propertyTax", label: "Property taxes" },
+    { key: "sewer", label: "Sewer" },
+    { key: "water", label: "Water" },
+    { key: "garbage", label: "Garbage" },
+    { key: "wiring", label: "Home wiring insurance" },
+    { key: "materials", label: "Materials / supplies" },
+    { key: "maintenance", label: "Maintenance" },
+    { key: "utilities", label: "Other utilities" },
+    { key: "other", label: "Other expenses" },
+  ];
+  const annualPoolTotal = poolLabels.reduce((sum, item) => sum + (parseMoney(expensePools[item.key]) ?? 0), 0);
+  const lotSpecificAnnual = (lot: Lot) =>
+    ["maintCost", "mowCost", "acCost", "roofCost", "washCost", "inspectCost", "taxCost", "sewerCost", "waterCost", "garbageCost"]
+      .reduce((sum, key) => sum + (parseMoney(String(lot[key as keyof Lot] ?? "")) ?? 0), 0);
+  const monthlyExpense = (lot: Lot) => {
+    const sharedAnnual = poolLabels.reduce((sum, item) => {
+      const amount = parseMoney(expensePools[item.key]) ?? 0;
+      if (item.key === "insurance") {
+        return sum + (lot.homeIns === "Yes" && insuredHomes.length ? amount / insuredHomes.length : 0);
+      }
+      if (item.key === "wiring") {
+        const wiredHomes = homes.filter((home) => home.wiring === "Yes");
+        return sum + (lot.wiring === "Yes" && wiredHomes.length ? amount / wiredHomes.length : 0);
+      }
+      return sum + (homes.length ? amount / homes.length : 0);
+    }, 0);
+    return (sharedAnnual + lotSpecificAnnual(lot)) / 12;
+  };
+  const worseHigh = metric === "monthExpense" || metric === "yearExpense" || metric === "owed";
+  const scored = homes
+    .flatMap((lot) => {
+      const rent = lot.status === "Empty" ? 0 : (parseMoney(lot.rent) ?? 0);
+      const expense = monthlyExpense(lot);
+      const profit = rent - expense - (lot.status === "Empty" ? 540 : 0);
+      const ratio = rent > 0 ? (profit / rent) * 100 : profit < 0 ? -100 : null;
+      const pets = (lot.dogs === "1" || lot.dogs === "2" ? Number(lot.dogs) : 0) + (lot.cats === "1" || lot.cats === "2" ? Number(lot.cats) : 0);
+      const violations = (lot.violations ?? "").split(/\n+/).map((line) => line.trim()).filter(Boolean).length;
+      const marks = ((lot.lateRent ?? "").trim() ? 1 : 0) + ((lot.bouncedCheck ?? "").trim() ? 1 : 0);
+      const residents = lot.name.split(/\s*\/\s*/).map((part) => part.trim()).filter(Boolean).length;
+      const overall = ratio == null ? null : ratio - pets * 10 - violations * 5 - marks * 10 + (residents === 1 ? 10 : 0);
+      const figures: Record<HeatMetric, number | null> = {
+        overall,
+        roi: ratio,
+        monthProfit: profit,
+        yearProfit: profit * 12,
+        monthExpense: expense,
+        yearExpense: expense * 12,
+        monthRent: rent,
+        yearRent: rent * 12,
+        owed: parseMoney(lot.balance) ?? 0,
+      };
+      const amount = figures[metric];
+      if (amount == null || ratio == null) return [];
+      return [{ lot, amount, ratio }];
+    })
+    .sort((a, b) => (worseHigh ? a.amount - b.amount : b.amount - a.amount) || Number(a.lot.lot) - Number(b.lot.lot));
+  const paint: Record<string, { fill: string; ink: string; value: string }> = {};
+  const standing = (amount: number) => {
+    if (scored.length <= 1) return 100;
+    const behind = scored.filter((row) => (worseHigh ? row.amount > amount : row.amount < amount)).length;
+    const tied = scored.filter((row) => row.amount === amount).length;
+    return ((behind + tied) / scored.length) * 100;
+  };
+  const label = (amount: number) => (metric === "roi" ? `${Math.round(standing(amount))}%` : metric === "overall" ? `${Math.round(amount)}%` : shownAmount(String(Math.round(amount * 100) / 100)));
+  scored.forEach((row) => {
+    const band = heatBand(standing(row.amount));
+    const value = label(row.amount);
+    paint[row.lot.id] = { fill: band.color, ink: heatInk(band.color), value };
+  });
+  const metricLabel = HEAT_METRICS.find((item) => item[0] === metric)?.[1] ?? "Value";
+  const lotFilterLabel = lotFilters.length === 0 ? "All" : lotFilters.length === 1 ? lotFilterNames.find(([id]) => id === lotFilters[0])?.[1] ?? "All" : `${lotFilters.length} on`;
+  const counted = scoped.filter((lot) => lot.status !== "Open" && (lotFilters.length === 0 || lotFilters.some((item) => matchesFilter(lot, item))));
+  const rentSum = counted.reduce((sum, lot) => sum + (lot.status === "Empty" ? 0 : (parseMoney(lot.rent) ?? 0)), 0);
+  const expenseSum = counted.reduce((sum, lot) => sum + monthlyExpense(lot), 0);
+  const emptyCount = counted.filter((lot) => lot.status === "Empty").length;
+  const profitSum = rentSum - expenseSum - emptyCount * 540;
+  const owedSum = counted.reduce((sum, lot) => sum + (parseMoney(lot.balance) ?? 0), 0);
+  const metricTotal =
+    metric === "roi" ? (rentSum > 0 ? (profitSum / rentSum) * 100 : profitSum < 0 ? -100 : 0)
+    : metric === "overall" ? (scored.length ? scored.reduce((sum, row) => sum + row.amount, 0) / scored.length : 0)
+    : metric === "monthProfit" ? profitSum
+    : metric === "yearProfit" ? profitSum * 12
+    : metric === "monthExpense" ? expenseSum
+    : metric === "yearExpense" ? expenseSum * 12
+    : metric === "monthRent" ? rentSum
+    : metric === "yearRent" ? rentSum * 12
+    : owedSum;
+  const metricText = metric === "roi" || metric === "overall" ? `${Math.round(metricTotal)}%` : dollar(metricTotal);
+  if (mini) {
+    return (
+      <div className="mini-heat">
+        {([1, 2, 3] as const).map((id) => (
+          <PlatMap key={id} sheet={id} query="" filter="all" selected={selected} lots={lots} heat={paint} dropLot={dropLot} stickyIds={stickyIds} onSelect={onOpen} />
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div className="todo heat-board">
+      <div className="financial-window-actions">
+        <button type="button" className="tab" onClick={() => { const url = new URL(window.location.href); url.searchParams.set("view", "heat"); window.open(url.toString(), "_blank", "noopener,noreferrer"); }}>
+          Open financial dashboard in new window ↗
+        </button>
+      </div>
+      <section className={poolsOpen ? "expense-pools" : "expense-pools is-collapsed"} aria-label="Annual expense assumptions">
+        <button type="button" className="expense-pools-head" aria-expanded={poolsOpen} onClick={() => setPoolsOpen((open) => !open)}>
+          <div>
+            <h3>Annual expense assumptions</h3>
+            {poolsOpen ? <p>Adjust these community-wide costs to match actual bills. Values are saved in this browser.</p> : null}
+          </div>
+          <strong>{dollar(annualPoolTotal)} / year</strong>
+          <span className="expense-toggle" aria-hidden="true">{poolsOpen ? "▴" : "▾"}</span>
+        </button>
+        {poolsOpen ? (
+          <>
+            <div className="expense-pool-grid">
+              {poolLabels.map(({ key, label }) => (
+                <label key={key}>
+                  <span>{label}</span>
+                  <div className="expense-input-wrap">
+                    <span>$</span>
+                    <input
+                      aria-label={label + " annual shared expense"}
+                      inputMode="decimal"
+                      value={expensePools[key]}
+                      onChange={(event) => updateExpensePool(key, event.target.value)}
+                    />
+                    <small>/ yr</small>
+                  </div>
+                </label>
+              ))}
+            </div>
+            <p className="expense-pools-note">Shared costs are split across occupied and empty lots. A cost typed on a lot in the detail window stays on that lot only. Home insurance is split only across lots marked Home insurance Yes. Wiring insurance is split only across lots marked Yes.</p>
+          </>
+        ) : null}
+      </section>
+      <div className="heat-filter-row">
+      <div className="map-slot heat-metric-drop">
+        <button className="filter" type="button" aria-expanded={metricsOpen} onClick={() => { setLotsOpen(false); setMetricsOpen((open) => !open); }}>
+          {metricLabel} ▾
+        </button>
+        {metricsOpen ? (
+          <div className="map-drop filter-checks" role="group" aria-label="Financial filters">
+            {HEAT_METRICS.map(([id, name]) => (
+              <label key={id}>
+                <input
+                  type="checkbox"
+                  checked={metric === id}
+                  onChange={() => setMetric((current) => (current === id ? "overall" : id))}
+                />
+                {name}
+              </label>
+            ))}
+          </div>
+        ) : null}
+      </div>
+      <div className="map-slot heat-metric-drop">
+        <button className="filter" type="button" aria-expanded={lotsOpen} onClick={() => { setMetricsOpen(false); setLotsOpen((open) => !open); }}>
+          {lotFilterLabel} ▾
+        </button>
+        {lotsOpen ? (
+          <div className="map-drop filter-checks" role="group" aria-label="Lot filters">
+            <label>
+              <input type="checkbox" checked={lotFilters.length === 0} onChange={() => setLotFilters([])} />
+              All
+            </label>
+            {lotFilterNames.map(([id, name]) => (
+              <label key={id}>
+                <input
+                  type="checkbox"
+                  checked={lotFilters.includes(id)}
+                  onChange={() => setLotFilters((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]))}
+                />
+                {name}
+              </label>
+            ))}
+          </div>
+        ) : null}
+      </div>
+      </div>
+      <div className="money-totals">
+        <span>{metric === "roi" ? "Profit" : metricLabel} <b>{metricText}</b></span>
+      </div>
+      <div className="heat-legend">
+        {HEAT_STOPS.map((stop) => (
+          <span key={stop.label}>
+            <i style={{ background: stop.color }} />
+            {stop.label}
+          </span>
+        ))}
+        <span>
+          <i style={{ background: "#d5d0c8" }} />
+          No figure
+        </span>
+      </div>
+      <div className="map-stack">
+        {([1, 2, 3] as const).map((id) => (
+          <section key={id} className="map-block">
+            <h2>{SHEET_COPY[id].title}</h2>
+            <PlatMap sheet={id} query="" filter={lotFilters.length ? lotFilters : "all"} selected={selected} lots={lots} heat={paint} onSelect={onOpen} />
+          </section>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function formatTodoDate(stamp: string) {
+  const [y, m, d] = stamp.split("-").map(Number);
+  if (!y || !m || !d) return stamp;
+  return new Date(y, m - 1, d).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function TodoList({
+  items,
+  done,
+  onToggle,
+  onShift,
+  onOpen,
+  empty,
+  stickies = {},
+}: {
+  items: { id: string; lot: string; address: string; name: string; notes: string; text: string; date: string }[];
+  done: Set<string>;
+  onToggle: (id: string) => void;
+  onShift: (id: string, dir: -1 | 1) => void;
+  onOpen: (id: string) => void;
+  empty: string;
+  stickies?: Record<string, { id: string; text: string; color: string }[]>;
+}) {
+  if (items.length === 0) return <p className="todo-empty">{empty}</p>;
+  return (
+    <ul>
+      {items.map((item, index) => {
+        const checked = done.has(item.id);
+        const pins = stickies[item.id] ?? [];
+        return (
+          <li key={item.id} className={checked ? "done" : ""}>
+            <div className="todo-controls">
+              <button type="button" className="todo-arrow" aria-label="Higher priority" disabled={index === 0} onClick={() => onShift(item.id, -1)}>
+                ↑
+              </button>
+              <input type="checkbox" checked={checked} aria-label={checked ? "Mark not done" : "Completed"} onChange={() => onToggle(item.id)} />
+              <button type="button" className="todo-arrow" aria-label="Lower priority" disabled={index === items.length - 1} onClick={() => onShift(item.id, 1)}>
+                ↓
+              </button>
+            </div>
+            <button className="todo-card" type="button" onClick={() => onOpen(item.id)}>
+              <time>{item.date ? formatTodoDate(item.date) : "No date"}</time>
+              <span><b>Lot</b> {item.lot || "—"}</span>
+              <span><b>Address</b> {item.address || "—"}</span>
+              <span><b>Name</b> {item.name || "—"}</span>
+              {item.text ? <span><b>Due</b> {item.text}</span> : null}
+              <em><b>Notes</b> {item.notes || "—"}</em>
+              {pins.length ? (
+                <span className="todo-stickies">
+                  {pins.map((sticky) => (
+                    <i key={sticky.id} className="task-sticky" style={{ background: sticky.color || "#ffe56a" }}>{sticky.text}</i>
+                  ))}
+                </span>
+              ) : null}
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function blankGuest(): Guest {
+  return { name: "", year: "", make: "", tag: "", state: "", arrival: "", departure: "", card: null };
+}
+
+function GuestCards({ guests, onChange }: { guests: Guest[]; onChange: (next: Guest[]) => void }) {
+  function set(index: number, patch: Partial<Guest>) {
+    onChange(guests.map((guest, i) => (i === index ? { ...guest, ...patch } : guest)));
+  }
+  return (
+    <>
+      {guests.map((guest, index) => (
+        <div className="guest-card" key={index}>
+          <p className="pet-title">{guests.length > 1 ? `Guest ${index + 1}` : "Guest"}</p>
+          <label className="wiring-field">
+            <span>Guest's name</span>
+            <input value={guest.name} onChange={(e) => set(index, { name: e.target.value })} />
+          </label>
+          <p className="pet-title">Guest's vehicle</p>
+          <div className="guest-vehicle">
+            <label className="wiring-field">
+              <span>Year</span>
+              <input value={guest.year} onChange={(e) => set(index, { year: e.target.value })} />
+            </label>
+            <label className="wiring-field">
+              <span>Make</span>
+              <input value={guest.make} onChange={(e) => set(index, { make: e.target.value })} />
+            </label>
+            <label className="wiring-field">
+              <span>Tag</span>
+              <input value={guest.tag} onChange={(e) => set(index, { tag: e.target.value })} />
+            </label>
+            <label className="wiring-field">
+              <span>State</span>
+              <input value={guest.state} onChange={(e) => set(index, { state: e.target.value })} />
+            </label>
+          </div>
+          <div className="guest-vehicle">
+            <label className="wiring-field">
+              <span>Arrival date</span>
+              <input type="date" value={guest.arrival} onChange={(e) => set(index, { arrival: e.target.value })} />
+            </label>
+            <label className="wiring-field">
+              <span>Departure date</span>
+              <input type="date" value={guest.departure} onChange={(e) => set(index, { departure: e.target.value })} />
+            </label>
+          </div>
+          <FileSlot label="Upload guest card" file={guest.card} onChange={(card) => set(index, { card })} />
+        </div>
+      ))}
+    </>
+  );
+}
+
+function FileSlot({
+  label,
+  file,
+  onChange,
+}: {
+  label: string;
+  file?: { name: string; data: string } | null;
+  onChange: (next: { name: string; data: string } | null) => void;
+}) {
+  return (
+    <div className="doc-slot">
+      <span>{label}</span>
+      {file?.data ? (
+        <div className="doc-file">
+          <a href={file.data} download={file.name}>
+            {file.name}
+          </a>
+          <button className="doc-remove" type="button" onClick={() => onChange(null)}>
+            Remove
+          </button>
+        </div>
+      ) : (
+        <input
+          type="file"
+          onChange={async (e) => {
+            const picked = e.target.files?.[0];
+            e.target.value = "";
+            if (!picked) return;
+            const data = await fileToData(picked);
+            if (!data) return;
+            onChange({ name: picked.name, data });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+const INSPECTION_ITEMS = [
+  ["maintenance", "Maintenance"],
+  ["mow", "MOW"],
+  ["acCleaning", "AC cleaning"],
+  ["acService", "AC service"],
+  ["acFilter", "AC filter"],
+  ["roofAge", "Roof age"],
+  ["roofMaterial", "Roof material"],
+  ["roofInstalled", "Roof installed"],
+  ["roofReplace", "Roof needs replaced"],
+  ["pressureWash", "Pressure wash"],
+] as const;
+
+function LotExtras({
+  values,
+  onChange,
+  onMoveOut,
+  onRentRoll,
+  part,
+}: {
+  values: Lot;
+  onChange: (next: Partial<Lot>) => void;
+  onMoveOut?: () => void;
+  onRentRoll?: () => void;
+  part: "personal" | "home" | "rent" | "notes" | "maintenance" | "empty";
+}) {
+  const yn = (value?: string) => (value === "Yes" || value === "No" ? value : "");
+  const [noticeOpen, setNoticeOpen] = useState(false);
+  const [noticeKind, setNoticeKind] = useState<NoticeKind>("three");
+  const [noticeForms, setNoticeForms] = useState(loadNoticeForms);
+  const noticeTitle = NOTICE_KINDS.find((item) => item[0] === noticeKind)?.[1] ?? "Notice";
+  return (
+    <>
+      {part === "maintenance" ? (
+      <>
+      <div className="pet-block">
+        <p className="pet-title">Maintenance</p>
+        <label className="wiring-field">
+          <span>Maintenance</span>
+          <input value={values.maintenance ?? ""} placeholder="Leak" onChange={(e) => onChange({ maintenance: e.target.value })} />
+        </label>
+        <label className="wiring-field">
+          <span>Cost</span>
+          <input value={values.maintCost ?? ""} inputMode="decimal" onChange={(e) => onChange({ maintCost: e.target.value })} />
+        </label>
+      </div>
+      <div className="pet-block" data-detail="mow">
+        <p className="pet-title">MOW</p>
+        <label className="wiring-field">
+          <span>MOW</span>
+          <select className="mow-select" value={values.noMow === "Yes" || values.noMow === "No" || values.noMow === "Owe-Mow" || values.noMow === "Owe" || values.noMow === "NO-OWE" || values.noMow === "Unmowed" ? (values.noMow === "Owe" || values.noMow === "NO-OWE" ? "Owe-Mow" : values.noMow) : ""} onChange={(e) => onChange({ noMow: e.target.value })}>
+            <option value="">—</option>
+            <option value="Yes">Yes</option>
+            <option value="No">No</option>
+            <option value="Owe-Mow">Owe-Mow</option>
+            <option value="Unmowed">Unmowed</option>
+          </select>
+        </label>
+        <label className="wiring-field">
+          <span>Amount Owed</span>
+          <input
+            value={values.mowCost ?? ""}
+            inputMode="decimal"
+            onChange={(e) => {
+              const mowCost = e.target.value;
+              const owed = Number(mowCost.replace(/[$,\s]/g, ""));
+              onChange(Number.isFinite(owed) && owed > 72 ? { mowCost, noMow: "Owe-Mow" } : { mowCost });
+            }}
+          />
+        </label>
+      </div>
+      <div className="pet-block">
+        <p className="pet-title">AC</p>
+        <div className="pet-row">
+          <label>
+            <span>Cleaning</span>
+            <input value={values.acCleaning ?? ""} onChange={(e) => onChange({ acCleaning: e.target.value })} />
+          </label>
+          <label>
+            <span>Service</span>
+            <input value={values.acService ?? ""} onChange={(e) => onChange({ acService: e.target.value })} />
+          </label>
+        </div>
+        <label className="wiring-field">
+          <span>Filter</span>
+          <input value={values.acFilter ?? ""} onChange={(e) => onChange({ acFilter: e.target.value })} />
+        </label>
+        <label className="wiring-field">
+          <span>Cost</span>
+          <input value={values.acCost ?? ""} inputMode="decimal" onChange={(e) => onChange({ acCost: e.target.value })} />
+        </label>
+      </div>
+      <div className="pet-block">
+        <p className="pet-title">Roof</p>
+        <div className="pet-row">
+          <label>
+            <span>Age</span>
+            <input value={values.roofAge ?? ""} onChange={(e) => onChange({ roofAge: e.target.value })} />
+          </label>
+          <label>
+            <span>Material</span>
+            <input value={values.roofMaterial ?? ""} onChange={(e) => onChange({ roofMaterial: e.target.value })} />
+          </label>
+        </div>
+        <div className="pet-row">
+          <label>
+            <span>Date installed</span>
+            <input value={values.roofInstalled ?? ""} onChange={(e) => onChange({ roofInstalled: e.target.value })} />
+          </label>
+          <label>
+            <span>Needs replaced</span>
+            <select className="mow-select" value={yn(values.roofReplace)} onChange={(e) => onChange({ roofReplace: e.target.value })}>
+              <option value="">—</option>
+              <option>Yes</option>
+              <option>No</option>
+            </select>
+          </label>
+        </div>
+        <label className="wiring-field">
+          <span>Cost</span>
+          <input value={values.roofCost ?? ""} inputMode="decimal" onChange={(e) => onChange({ roofCost: e.target.value })} />
+        </label>
+      </div>
+      <div className="pet-block">
+        <p className="pet-title">Pressure wash</p>
+        <label className="wiring-field">
+          <span>Pressure wash</span>
+          <select
+            className="mow-select"
+            value={values.pressureWash === "Yes" || values.pressureWash === "Needs" ? values.pressureWash : ""}
+            onChange={(e) => {
+              const pressureWash = e.target.value;
+              onChange({ pressureWash, washDate: pressureWash === "Yes" ? values.washDate?.trim() || dayStamp() : "" });
+            }}
+          >
+            <option value="">—</option>
+            <option>Yes</option>
+            <option>Needs</option>
+          </select>
+        </label>
+        {values.pressureWash === "Yes" ? (
+          <label className="wiring-field">
+            <span>Date</span>
+            <input type="date" value={(values.washDate ?? "").slice(0, 10)} onChange={(e) => onChange({ washDate: e.target.value })} />
+          </label>
+        ) : null}
+      </div>
+      <div className="pet-block">
+        <p className="pet-title">Home inspection</p>
+        <ul className="inventory">
+          {INSPECTION_ITEMS.map(([key, label]) => (
+            <li key={key}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={values.inspectionChecks?.[key] === "Yes"}
+                  onChange={(e) => {
+                    const checks = { ...(values.inspectionChecks ?? {}), [key]: e.target.checked ? "Yes" : "" };
+                    const done = INSPECTION_ITEMS.every(([id]) => checks[id] === "Yes");
+                    onChange({ inspectionChecks: checks, inspectionDate: done ? values.inspectionDate?.trim() || dayStamp() : "" });
+                  }}
+                />
+                {label}
+              </label>
+            </li>
+          ))}
+        </ul>
+        <label className="wiring-field">
+          <span>Date</span>
+          <input type="date" value={values.inspectionDate ?? ""} onChange={(e) => onChange({ inspectionDate: e.target.value })} />
+        </label>
+        <label className="wiring-field">
+          <span>Notes</span>
+          <textarea rows={4} value={values.inspectionNotes ?? ""} onChange={(e) => onChange({ inspectionNotes: e.target.value })} />
+        </label>
+        <label className="wiring-field">
+          <span>Cost</span>
+          <input value={values.inspectCost ?? ""} inputMode="decimal" onChange={(e) => onChange({ inspectCost: e.target.value })} />
+        </label>
+      </div>
+      </>
+      ) : null}
+      {part === "home" ? (
+      <div className="pet-block">
+        <p className="pet-title">Home inventory</p>
+        <ul className="inventory">
+          {(
+            [
+              ["fridge", "Refrigerator"],
+              ["stove", "Stove"],
+              ["washer", "Washer"],
+              ["dryer", "Dryer"],
+              ["microwave", "Microwave"],
+            ] as const
+          ).map(([key, label]) => {
+            const raw = String(values[key] ?? "").trim().toLowerCase();
+            const on = raw !== "" && raw !== "no";
+            return (
+              <li key={key}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={on}
+                    onChange={(e) => onChange({ [key]: e.target.checked ? "Yes" : "" })}
+                  />
+                  {label}
+                </label>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+      ) : null}
+      {part === "rent" ? (
+      <>
+      <div className="pet-block">
+        <p className="pet-title">Money</p>
+        <div className="pet-row">
+          <label>
+            <span>Total</span>
+            <input
+              value={values.rent}
+              onChange={(e) => onChange({ rent: e.target.value, homeRent: rentGap(e.target.value, values.lotRent ?? "", petFee(values.dogs, values.cats)) })}
+            />
+          </label>
+          <label>
+            <span>Late rent</span>
+            <input value={values.lateRent} onChange={(e) => onChange({ lateRent: e.target.value })} />
+          </label>
+        </div>
+        <div className="pet-row">
+          <label>
+            <span>Lot rent</span>
+            <input
+              value={values.status === "Occupied" ? (values.lotRent ?? "") : ""}
+              disabled={values.status !== "Occupied"}
+              onChange={(e) => onChange({ lotRent: e.target.value })}
+            />
+          </label>
+          <label>
+            <span>Home rent</span>
+            <input
+              value={values.homeRent ?? ""}
+              onChange={(e) => onChange({ homeRent: e.target.value, rent: rentTotal(values.lotRent, e.target.value, petFee(values.dogs, values.cats)) })}
+            />
+          </label>
+        </div>
+        <label className="wiring-field">
+          <span>Pet fee · $15 each</span>
+          <input value={String(petFee(values.dogs, values.cats))} readOnly />
+        </label>
+        <div className="pet-row">
+          <label>
+            <span>08/2026 increase</span>
+            <input value={values.rentInc2026 ?? ""} onChange={(e) => onChange({ rentInc2026: e.target.value })} />
+          </label>
+          <label>
+            <span>08/2027</span>
+            <input value={values.rentInc2027 ?? ""} onChange={(e) => onChange({ rentInc2027: e.target.value })} />
+          </label>
+        </div>
+        {onRentRoll ? (
+          <button className="filter" type="button" onClick={onRentRoll}>
+            Rent increase
+          </button>
+        ) : null}
+        <label className="wiring-field">
+          <span>Bounced check</span>
+          <input value={values.bouncedCheck ?? ""} onChange={(e) => onChange({ bouncedCheck: e.target.value })} />
+        </label>
+        <div className="pet-row">
+          <label>
+            <span>Move-in</span>
+            <input type="date" value={values.moveIn ?? ""} onChange={(e) => onChange({ moveIn: e.target.value })} />
+          </label>
+          <label>
+            <span>Lease end</span>
+            <input type="date" value={values.leaseEnd ?? ""} onChange={(e) => onChange({ leaseEnd: e.target.value })} />
+          </label>
+        </div>
+        <label className="wiring-field">
+          <span>Rent due</span>
+          <input type="date" value={values.rentDue ?? ""} onChange={(e) => onChange({ rentDue: e.target.value })} />
+        </label>
+        <div className="pet-row">
+          <label>
+            <span>Deposit</span>
+            <input value={values.deposit ?? ""} onChange={(e) => onChange({ deposit: e.target.value })} />
+          </label>
+          <label>
+            <span>Still owed</span>
+            <input value={values.balance ?? ""} onChange={(e) => onChange({ balance: e.target.value })} />
+          </label>
+        </div>
+        {onMoveOut ? (
+          <button className="filter move-out" type="button" onClick={onMoveOut}>
+            Move out
+          </button>
+        ) : null}
+      </div>
+      <PreviousTenants values={values} onChange={onChange} />
+      <Fold title="Notice">
+        <label className="wiring-field">
+          <span>Date</span>
+          <input type="date" value={values.noticeDate ?? ""} onChange={(e) => onChange({ noticeDate: e.target.value })} />
+        </label>
+        <label className="wiring-field">
+          <span>Note</span>
+          <textarea rows={3} value={values.noticeNote ?? ""} onChange={(e) => onChange({ noticeNote: e.target.value })} />
+        </label>
+        <label className="wiring-field">
+          <span>Type</span>
+          <select className="mow-select" value={noticeKind} onChange={(e) => setNoticeKind(e.target.value as NoticeKind)}>
+            {NOTICE_KINDS.map(([id, label]) => (
+              <option key={id} value={id}>{label}</option>
+            ))}
+          </select>
+        </label>
+        <div className="notice-actions">
+          <button className="filter" type="button" onClick={() => printNotice(values, noticeKind)}>
+            Print notice
+          </button>
+          <button className="filter" type="button" onClick={() => setNoticeOpen(true)}>
+            Upload notice
+          </button>
+        </div>
+        {noticeForms[noticeKind]?.name ? <p className="qb-note">{noticeTitle}: {noticeForms[noticeKind]?.name}</p> : <p className="qb-note">No {noticeTitle.toLowerCase()} uploaded yet.</p>}
+      </Fold>
+      </>
+      ) : null}
+      {part === "personal" ? (
+      <Fold title="Emergency contact">
+        <div className="pet-row">
+          <label>
+            <span>Name</span>
+            <input value={values.emergencyName ?? ""} onChange={(e) => onChange({ emergencyName: e.target.value })} />
+          </label>
+          <label>
+            <span>Phone</span>
+            <input value={values.emergencyPhone ?? ""} onChange={(e) => onChange({ emergencyPhone: e.target.value })} />
+          </label>
+        </div>
+      </Fold>
+      ) : null}
+      {part === "rent" ? (
+      <Fold title="Eviction">
+        <label className="wiring-field">
+          <span>Court date</span>
+          <input type="date" value={values.courtDate ?? ""} onChange={(e) => onChange({ courtDate: e.target.value })} />
+        </label>
+        <label className="wiring-field">
+          <span>Note</span>
+          <textarea rows={3} value={values.courtNote ?? ""} onChange={(e) => onChange({ courtNote: e.target.value })} />
+        </label>
+      </Fold>
+      ) : null}
+      {part === "empty" && values.status === "Empty" ? (
+      <div className="pet-block">
+        <p className="pet-title">Waiting list</p>
+        <div className="pet-row">
+          <label>
+            <span>Name</span>
+            <input value={values.waitName ?? ""} onChange={(e) => onChange({ waitName: e.target.value })} />
+          </label>
+          <label>
+            <span>Phone</span>
+            <input value={values.waitPhone ?? ""} onChange={(e) => onChange({ waitPhone: e.target.value })} />
+          </label>
+        </div>
+      </div>
+      ) : null}
+      {part === "maintenance" ? (
+      <div className="pet-block">
+        <p className="pet-title">Maintenance log</p>
+        <button
+          className="filter"
+          type="button"
+          onClick={() =>
+            onChange({
+              maintLog: [{ id: String(Date.now()), date: dayStamp(), note: "", done: "" }, ...(values.maintLog ?? [])],
+            })
+          }
+        >
+          Add job
+        </button>
+        <ul className="maint-log">
+          {sortedJobs(values.maintLog).map((job) => (
+            <li key={job.id}>
+              <input
+                type="date"
+                value={parseDay(job.date)}
+                onChange={(e) => onChange({ maintLog: updateJob(values.maintLog, job.id, { date: e.target.value }) })}
+              />
+              <input
+                value={job.note}
+                placeholder="What was wrong"
+                onChange={(e) => onChange({ maintLog: updateJob(values.maintLog, job.id, { note: e.target.value }) })}
+              />
+              <label>
+                <input
+                  type="checkbox"
+                  checked={job.done === "Yes"}
+                  onChange={(e) => onChange({ maintLog: updateJob(values.maintLog, job.id, { done: e.target.checked ? "Yes" : "" }) })}
+                />
+                Done
+              </label>
+            </li>
+          ))}
+        </ul>
+      </div>
+      ) : null}
+      {part === "home" ? (
+      <div className="pet-block">
+        <p className="pet-title">Photo</p>
+        <label className="wiring-field">
+          <span>Home</span>
+          <input
+            type="file"
+            accept="image/*"
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (!file) return;
+              onChange({ photo: await fileToData(file) });
+            }}
+          />
+        </label>
+        {values.photo ? <img className="lot-photo" src={values.photo} alt="" /> : null}
+        {values.photo ? (
+          <button className="doc-remove" type="button" onClick={() => onChange({ photo: "" })}>
+            Remove photo
+          </button>
+        ) : null}
+      </div>
+      ) : null}
+      {part === "rent" ? (
+      <>
+      <div className="pet-block">
+        <p className="pet-title">Documents</p>
+        <FileSlot label="Lease" file={values.lease} onChange={(lease) => onChange({ lease })} />
+        <FileSlot label="Rules receipt" file={values.rulesReceipt} onChange={(rulesReceipt) => onChange({ rulesReceipt })} />
+        <FileSlot label="Background check" file={values.background} onChange={(background) => onChange({ background })} />
+        <div className="doc-slot">
+          <span>Any other</span>
+          <input
+            type="file"
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (!file) return;
+              const data = await fileToData(file);
+              if (!data) return;
+              onChange({ otherDocs: [...(values.otherDocs ?? []), { name: file.name, data }] });
+            }}
+          />
+          <ul className="doc-list">
+            {(values.otherDocs ?? []).map((doc, index) => (
+              <li key={`${doc.name}-${index}`}>
+                <a href={doc.data} download={doc.name}>
+                  {doc.name}
+                </a>
+                <button
+                  className="doc-remove"
+                  type="button"
+                  onClick={() => onChange({ otherDocs: (values.otherDocs ?? []).filter((_, i) => i !== index) })}
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+      {noticeOpen ? (
+        <div className="notice-pop" role="presentation" onClick={() => setNoticeOpen(false)}>
+          <div className="notice-card" role="dialog" aria-label="Upload notice" onClick={(e) => e.stopPropagation()}>
+            <p className="pet-title">Upload {noticeTitle.toLowerCase()}</p>
+            <p className="notice-who">
+              Lot {values.lot} · {displayName(values)}
+            </p>
+            <label className="notice-drop">
+              <span>{noticeForms[noticeKind]?.name || "Choose a PDF or photo"}</span>
+              <input
+                type="file"
+                accept="image/*,.pdf,application/pdf"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = "";
+                  if (!file) return;
+                  const data = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")
+                    ? file.size > 4_000_000
+                      ? ""
+                      : await readAsData(file)
+                    : await fileToData(file);
+                  if (!data) return;
+                  setNoticeForms(saveNoticeForm(noticeKind, { name: file.name, data }));
+                }}
+              />
+            </label>
+            {noticeForms[noticeKind]?.data ? (
+              <div className="doc-file">
+                <a href={noticeForms[noticeKind]?.data} download={noticeForms[noticeKind]?.name}>
+                  Open file
+                </a>
+                <button className="doc-remove" type="button" onClick={() => setNoticeForms(saveNoticeForm(noticeKind, null))}>
+                  Remove
+                </button>
+              </div>
+            ) : null}
+            <div className="notice-actions">
+              <button className="filter" type="button" onClick={() => printNotice(values, noticeKind)}>
+                Print notice
+              </button>
+              <button className="filter" type="button" onClick={() => setNoticeOpen(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      </>
+      ) : null}
+    </>
+  );
+}
+
+function PetSelects({
+  dogs,
+  cats,
+  onChange,
+}: {
+  dogs: string;
+  cats: string;
+  onChange: (next: { dogs?: string; cats?: string }) => void;
+}) {
+  return (
+    <div className="pet-row">
+      <label>
+        <span>Dogs</span>
+        <select className="mow-select" value={dogs === "1" || dogs === "2" ? dogs : ""} onChange={(e) => onChange({ dogs: e.target.value })}>
+          <option value="">—</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+        </select>
+      </label>
+      <label>
+        <span>Cats</span>
+        <select className="mow-select" value={cats === "1" || cats === "2" ? cats : ""} onChange={(e) => onChange({ cats: e.target.value })}>
+          <option value="">—</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+        </select>
+      </label>
+    </div>
+  );
+}
+
+function residentsOf(name: string): { first: string; last: string }[] {
+  const chunks = name.split(/\s*\/\s*/).map((part) => part.trim()).filter(Boolean);
+  if (chunks.length === 0) return [{ first: "", last: "" }];
+  return chunks.map(nameParts);
+}
+
+function joinResidents(people: { first: string; last: string }[]) {
+  return people.map((person) => joinName(person.last, person.first)).filter(Boolean).join(" / ");
+}
+
+function NameSplit({ name, onChange }: { name: string; onChange?: (name: string) => void }) {
+  const [people, setPeople] = useState(() => residentsOf(name));
+  const written = useRef(name);
+  useEffect(() => {
+    if (name === written.current) return;
+    written.current = name;
+    setPeople(residentsOf(name));
+  }, [name]);
+  function commit(next: { first: string; last: string }[]) {
+    const list = next.length > 0 ? next : [{ first: "", last: "" }];
+    const joined = joinResidents(list);
+    written.current = joined;
+    setPeople(list);
+    onChange?.(joined);
+  }
+  return (
+    <div className="name-residents">
+      {people.map((person, index) => (
+        <div className={index > 0 ? "name-split extra-resident" : "name-split"} key={index}>
+          {index > 0 && onChange ? (
+            <button
+              className="remove-resident"
+              type="button"
+              aria-label="Remove resident"
+              onClick={() => commit(people.filter((_, i) => i !== index))}
+            >
+              ×
+            </button>
+          ) : null}
+          <label>
+            <span>First name</span>
+            {onChange ? (
+              <input
+                value={person.first}
+                onChange={(e) => commit(people.map((item, i) => (i === index ? { ...item, first: e.target.value } : item)))}
+              />
+            ) : (
+              <div className="name-box">{person.first || "—"}</div>
+            )}
+          </label>
+          <label>
+            <span>Last name</span>
+            {onChange ? (
+              <input
+                value={person.last}
+                onChange={(e) => commit(people.map((item, i) => (i === index ? { ...item, last: e.target.value } : item)))}
+              />
+            ) : (
+              <div className="name-box">{person.last || "—"}</div>
+            )}
+          </label>
+        </div>
+      ))}
+      {onChange ? (
+        <button className="add-resident" type="button" onClick={() => commit([...people, { first: "", last: "" }])}>
+          Add resident
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+

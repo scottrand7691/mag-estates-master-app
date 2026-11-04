@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Magnolia Estates site plan",
+      "hasCanvas": false,
+      "bodyTextLen": 289,
+      "bodyTextHash": "f3477e4c3a2cd5628789ec596eb323b0162307cab82eb3e2d6e16c90e7aabc88",
+      "bodyTextPrefix": "Magnolia Central of Florida Estates 0 lots 0 occupied 0 empty 0 ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Magnolia Estates site plan",
+      "hasCanvas": false,
+      "bodyTextLen": 289,
+      "bodyTextHash": "f3477e4c3a2cd5628789ec596eb323b0162307cab82eb3e2d6e16c90e7aabc88",
+      "bodyTextPrefix": "Magnolia Central of Florida Estates 0 lots 0 occupied 0 empty 0 ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}

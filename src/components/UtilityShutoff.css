@@ -1,0 +1,9 @@
+.utility-shutoff { padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.utility-shutoff__banner { background: #dc3545; color: white; padding: 8px; border-radius: 4px; font-weight: 700; margin-bottom: 10px; text-align: center; }
+.utility-shutoff__row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.utility-shutoff__row.restored { opacity: 0.5; }
+.utility-shutoff__row select, .utility-shutoff__row input { padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--input-bg); color: var(--text); font-size: 13px; }
+.restore-btn { padding: 4px 10px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.restored-tag { font-size: 12px; color: var(--text-secondary); }
+.add-btn { margin-top: 8px; padding: 6px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; color: var(--text); }
+[data-theme="dark"] .add-btn { background: var(--surface-dark); }

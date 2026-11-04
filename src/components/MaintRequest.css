@@ -1,0 +1,25 @@
+.maint-request { padding: 16px; }
+.maint-request__form { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.maint-request__form input, .maint-request__form select, .maint-request__form textarea { padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--input-bg); color: var(--text); font-family: inherit; }
+.photo-preview { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; }
+.submit-btn { padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; }
+.maint-request__card { padding: 12px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 10px; background: var(--surface); border-left: 4px solid var(--border); }
+.urgency--emergency { border-left-color: #dc3545; }
+.urgency--high { border-left-color: #fd7e14; }
+.urgency--medium { border-left-color: #ffc107; }
+.urgency--low { border-left-color: #28a745; }
+.card-header { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.urgency-tag, .status-tag { font-size: 11px; padding: 2px 6px; border-radius: 3px; text-transform: uppercase; }
+.urgency-tag { background: #eee; }
+.status--open .status-tag { background: #cce5ff; color: #004085; }
+.status--in_progress .status-tag { background: #fff3cd; color: #856404; }
+.status--done .status-tag { background: #d4edda; color: #155724; }
+.card-photo { max-width: 200px; border-radius: 4px; margin: 8px 0; }
+.card-meta { font-size: 11px; color: var(--text-secondary); }
+.card-actions { display: flex; gap: 8px; margin-top: 8px; }
+.card-actions input { padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--input-bg); color: var(--text); font-size: 12px; }
+.card-actions button { padding: 4px 10px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.empty { color: var(--text-secondary); font-style: italic; }
+[data-theme="dark"] .maint-request__form, [data-theme="dark"] .maint-request__card { background: var(--surface-dark); }
+[data-theme="dark"] .urgency-tag { background: #333; }
+@media print { .maint-request__form, .card-actions { display: none; } }
