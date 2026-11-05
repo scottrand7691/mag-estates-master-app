@@ -2186,6 +2186,7 @@ function Home() {
   useEffect(() => {
     setAuditUser(landlordName || managerName || (residentId ? "Resident" : vendorId ? "Vendor" : maintenance ? "Maintenance" : ""));
   }, [landlordName, managerName, residentId, vendorId, maintenance]);
+  const showMoney = session?.role === "landlord";
   useEffect(() => {
     if (!manager) return;
     if (view === "home" || view === "meeting" || view === "todo" || view === "business" || view === "heat" || view === "register" || view === "audit" || view === "increase" || view === "alert" || view === "hoa") setView("map");
@@ -2810,15 +2811,7 @@ function Home() {
           </div>
           </div>
           <div className="tabs" role="tablist" aria-label="Sections">
-          {session?.role === "manager" ? (
-            <>
-              <button className="tab" type="button" role="tab" aria-pressed={view === "mgrtodo"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("mgrtodo"); }}>To-Do</button>
-              <button className="tab" type="button" role="tab" aria-pressed={view === "mow"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("mow"); }}>Mow</button>
-              <button className="tab" type="button" role="tab" aria-pressed={view === "handyman"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("handyman"); }}>Maintenance</button>
-              <button className="tab" type="button" role="tab" aria-pressed={view === "plant"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("plant"); }}>Treatment Plant</button>
-              <button className="tab" type="button" role="tab" aria-pressed={view === "vendors"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("vendors"); }}>Vendors</button>
-            </>
-          ) : (
+          {showMoney ? (
             <>
               {(
                 [
@@ -2840,6 +2833,14 @@ function Home() {
               <button className="tab tab-end" type="button" role="tab" data-view="register" aria-pressed={view === "register"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("register"); }}>
                 Register
               </button>
+            </>
+          ) : (
+            <>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "mgrtodo"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("mgrtodo"); }}>To-Do</button>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "mow"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("mow"); }}>Mow</button>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "handyman"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("handyman"); }}>Maintenance</button>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "plant"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("plant"); }}>Treatment Plant</button>
+              <button className="tab" type="button" role="tab" aria-pressed={view === "vendors"} onClick={() => { setMapsOpen(false); setFiltersOpen(false); setDataOpen(false); setView("vendors"); }}>Vendors</button>
             </>
           )}
           <button className="theme-toggle" type="button" aria-pressed={dark} onClick={() => setDark((on) => !on)}>
@@ -3059,7 +3060,7 @@ function Home() {
           {!hydrated ? (
             <p className="qb-note">Loading saved lots…</p>
           ) : view === "home" ? (
-            session?.role === "manager" ? null : <HomeBoard lots={lots} onOpen={(id) => setView(id as typeof view)} />
+            showMoney ? <HomeBoard lots={lots} onOpen={(id) => setView(id as typeof view)} /> : null
           ) : view === "plant" ? (
             <TreatmentPlant />
           ) : view === "handyman" ? (
@@ -3102,11 +3103,11 @@ function Home() {
           ) : view === "alert" ? (
             <AlertBoard lots={lots} onOpen={openLot} />
           ) : view === "heat" ? (
-            session?.role === "manager" ? null : <HeatBoard lots={lots} scoped={visible} selected={selected} onOpen={openLot} />
+            showMoney ? <HeatBoard lots={lots} scoped={visible} selected={selected} onOpen={openLot} /> : null
           ) : view === "business" ? (
-            session?.role === "manager" ? null : <BusinessBoard lots={lots} />
+            showMoney ? <BusinessBoard lots={lots} /> : null
           ) : view === "meeting" ? (
-            session?.role === "manager" ? null : <MeetingBoard lots={lots} onOpen={openLot} onSave={saveLot} resident={Boolean(residentId)} />
+            showMoney ? <MeetingBoard lots={lots} onOpen={openLot} onSave={saveLot} resident={Boolean(residentId)} /> : null
           ) : view === "register" ? (
             <>
               <RegisterTable
@@ -3930,7 +3931,7 @@ function LoginScreen({ lots, onEnter }: { lots: Lot[]; onEnter: (next: Session) 
         <label>New landlord password<input type="password" value={nextPass} placeholder="Leave blank to keep it" autoComplete="new-password" onChange={(e) => setNextPass(e.target.value)} /></label>
       ) : null}
       {mode === "resident" ? <p className="login-explain">Use your address number and the password the park gave you. That password is your first initial, your last initial, your last four, then @&. You can see the map and your own home. Changes wait for Clint Horne to approve them.</p> : null}
-      {mode === "manager" ? <p className="login-explain">Choose Belkis. The password is the same one the landlord uses. Business and Financial stay off this sign-in.</p> : null}
+      {mode === "manager" ? <p className="login-explain">Choose Belkis and use the landlord password. This sign-in is the map, mow, maintenance, the plant, and vendors.</p> : null}
       {mode === "vendor" ? <p className="login-explain">The username is the first word of your company name. Leave the password blank. You can upload liability, license, and workers comp, and see the map with the name, address, and lot number.</p> : null}
       {error ? <p className="login-error">{error}</p> : null}
       {sent ? <p className="quiet">{sent}</p> : null}

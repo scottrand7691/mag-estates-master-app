@@ -131,7 +131,7 @@ var HEADERS = { TSS_SHELL: "X-TSS_SHELL" };
 * the dev styles URL for route-scoped CSS collection.
 */
 async function getStartManifest(matchedRoutes) {
-	const { tsrStartManifest } = await import("../_tanstack-start-manifest_v-CkgYDw9L.mjs");
+	const { tsrStartManifest } = await import("../_tanstack-start-manifest_v-Bdr0C3SL.mjs");
 	const startManifest = tsrStartManifest();
 	let routes = startManifest.routes;
 	routes[rootRouteId];
@@ -153,19 +153,19 @@ async function getStartManifest(matchedRoutes) {
 var manifest = {
 	"0d283d3d517162bd48f85e35e2d927aecdd4330c6221170586dedfcc4acd49c7": {
 		functionName: "saveBusinessTask_createServerFn_handler",
-		importer: () => import("./business.functions-C_7BOQa5.mjs")
+		importer: () => import("./business.functions-BeJI0HlO.mjs")
 	},
 	"1925c895ac0841476583c81f943169d9c2408c84137bd32b94e4702282cc7b68": {
 		functionName: "deleteBusinessTask_createServerFn_handler",
-		importer: () => import("./business.functions-C_7BOQa5.mjs")
+		importer: () => import("./business.functions-BeJI0HlO.mjs")
 	},
 	"1a1fd9891ffa60846cb36aa3af906502a1b7e742c8f2b4799b710794f9ae757f": {
 		functionName: "readBusinessAttachment_createServerFn_handler",
-		importer: () => import("./business.functions-C_7BOQa5.mjs")
+		importer: () => import("./business.functions-BeJI0HlO.mjs")
 	},
 	"2ef8254051bee5948228ea49ef0a9f659af201aeae53b6baab7aa3b24755fc11": {
 		functionName: "deleteBusinessAttachment_createServerFn_handler",
-		importer: () => import("./business.functions-C_7BOQa5.mjs")
+		importer: () => import("./business.functions-BeJI0HlO.mjs")
 	},
 	"63b2278e80f850fb8a80f752dae9b14d45011a628e2335494e988a272f4c8a3d": {
 		functionName: "listVersions_createServerFn_handler",
@@ -173,11 +173,11 @@ var manifest = {
 	},
 	"728d9011e139b7691e25ed4b000ca7249ef42843a601eb07b93fb0fb6d8402e3": {
 		functionName: "listBusinessAttachments_createServerFn_handler",
-		importer: () => import("./business.functions-C_7BOQa5.mjs")
+		importer: () => import("./business.functions-BeJI0HlO.mjs")
 	},
 	"81d85d3e1ed96526137983ca2ca9e8749801d3fb5bf98ff108ec1affaab820f5": {
 		functionName: "addBusinessAttachment_createServerFn_handler",
-		importer: () => import("./business.functions-C_7BOQa5.mjs")
+		importer: () => import("./business.functions-BeJI0HlO.mjs")
 	},
 	"8a5c096e51c7fa1603bcbebdffe4f71a0c7c825cc457d059b29c650e22041394": {
 		functionName: "saveBills_createServerFn_handler",
@@ -189,7 +189,7 @@ var manifest = {
 	},
 	"a5927577ce861885ea3c00c3753b5f2ae9f213a553abe39b4337e148b1984362": {
 		functionName: "listBusinessTasks_createServerFn_handler",
-		importer: () => import("./business.functions-C_7BOQa5.mjs")
+		importer: () => import("./business.functions-BeJI0HlO.mjs")
 	},
 	"a69e9ce8decaba572e2a0b279bb6090ff0d09bec755a1b4e3629e0bc1600ddf1": {
 		functionName: "writeMaster_createServerFn_handler",
@@ -201,7 +201,7 @@ var manifest = {
 	},
 	"cfc0b9ac2b14c5ef3ff5442b1f586f4ea5aa8c4ee1b2c819abb5b52c9f8e7294": {
 		functionName: "listBusinessHistory_createServerFn_handler",
-		importer: () => import("./business.functions-C_7BOQa5.mjs")
+		importer: () => import("./business.functions-BeJI0HlO.mjs")
 	},
 	"d369c18cc29680223a2bc5a4ac5ceadfe62a988c086856d0301f283a1c882af7": {
 		functionName: "saveBoard_createServerFn_handler",
@@ -1614,7 +1614,7 @@ var getBaseManifest = getProdBaseManifest;
 var createEarlyHintsForRequest = createEarlyHintsCollector;
 async function loadEntries() {
 	const [routerEntry, startEntry, pluginAdapters] = await Promise.all([
-		import("./router--SNdsXaX.mjs"),
+		import("./router-B_CwQIhL.mjs"),
 		import("./start-5Z2QO8AU.mjs"),
 		import("./empty-plugin-adapters-D9UWiqvJ.mjs")
 	]);
