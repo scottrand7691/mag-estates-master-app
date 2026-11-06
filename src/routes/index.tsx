@@ -200,6 +200,50 @@ async function hostUp() {
   }
 }
 
+type RegisterBook = {
+  saved?: string;
+  lots?: Lot[];
+  bills?: unknown[];
+  mowings?: unknown[];
+  board?: unknown[];
+  store?: Record<string, string>;
+  force?: boolean;
+};
+
+function bookRichness(lots: Lot[]) {
+  const keys = ["phone", "email", "social4", "moveIn", "rentDue", "homeYear", "deposit", "balance", "emergencyPhone", "lotRent", "homeRent"] as const;
+  return lots.reduce((count, lot) => count + keys.filter((key) => String(lot[key] ?? "").trim()).length, 0);
+}
+
+async function publishedBook(): Promise<RegisterBook | null> {
+  try {
+    const res = await fetch(`/magnolia-register.json?v=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) return null;
+    const book = (await res.json()) as RegisterBook;
+    if (!book || !Array.isArray(book.lots) || book.lots.length === 0) return null;
+    return book;
+  } catch {
+    return null;
+  }
+}
+
+async function readRegister(): Promise<RegisterBook | null> {
+  let master: RegisterBook | null = null;
+  try {
+    master = (await readMaster()) as RegisterBook | null;
+  } catch {
+    master = null;
+  }
+  const published = await publishedBook();
+  const books = [master, published].filter((book): book is RegisterBook => Boolean(book?.lots?.length));
+  books.sort((left, right) => {
+    const bySaved = String(right.saved ?? "").localeCompare(String(left.saved ?? ""));
+    if (bySaved) return bySaved;
+    return bookRichness(right.lots as Lot[]) - bookRichness(left.lots as Lot[]);
+  });
+  return books[0] ?? null;
+}
+
 async function pushMaster(lots: Lot[]) {
   rememberLots(lots);
   reportSync("saving");
@@ -660,7 +704,7 @@ function restoreStore(store: Record<string, string> | undefined) {
 async function downloadEverything(lots: Lot[]) {
   const payload = masterPayload(lots);
   try {
-    const master = await readMaster();
+    const master = await readRegister();
     if (master?.store) {
       for (const [key, value] of Object.entries(master.store)) {
         if (payload.store[key] == null && typeof value === "string") payload.store[key] = value;
@@ -1393,7 +1437,7 @@ function MeetingBoard({ lots, onOpen, onSave, resident = false }: { lots: Lot[];
       return;
     }
     let active = true;
-    void readMaster()
+    void readRegister()
       .then((book) => {
         if (!active) return;
         const saved = Array.isArray(book?.board) ? (book.board as BoardNote[]) : [];
@@ -1981,7 +2025,7 @@ function BillsBoard({ onChange, children }: { onChange?: (bills: ParkBill[]) => 
 
   useEffect(() => {
     let cancel = false;
-    void readMaster()
+    void readRegister()
       .then((book) => {
         if (cancel || edited.current) return;
         const saved = Array.isArray(book?.bills) ? (book.bills as Partial<ParkBill>[]) : null;
@@ -2296,16 +2340,19 @@ function Home() {
       const local = loadLots();
       let next = local;
       try {
-        const master = await readMaster();
+        const master = await readRegister();
         let localAt = "";
+        let hadLocal = false;
         try {
+          hadLocal = Boolean(localStorage.getItem(STORAGE_KEY));
           localAt = localStorage.getItem(STORAGE_AT) ?? "";
         } catch {
           localAt = "";
         }
-        const masterStore = (master as { store?: Record<string, string>; force?: boolean } | null)?.store;
-        const forced = Boolean((master as { force?: boolean } | null)?.force);
-        if (master?.lots?.length && !forced && localAt && master.saved && localAt > master.saved) {
+        const masterStore = master?.store;
+        const forced = Boolean(master?.force);
+        const remoteRicher = Boolean(master?.lots?.length && bookRichness(master.lots) > bookRichness(local) + 3);
+        if (master?.lots?.length && !forced && hadLocal && !remoteRicher && localAt && master.saved && localAt > master.saved) {
           const byId = new Map((master.lots as Lot[]).map((lot) => [lot.id, lot]));
           const blank = (value: unknown) => value == null || value === "" || (Array.isArray(value) && value.length === 0);
           next = local.map((lot) => {
@@ -5017,7 +5064,7 @@ function MowBoard({ lots, onOpen }: { lots: Lot[]; onOpen: (id: string) => void 
 
   useEffect(() => {
     let cancel = false;
-    void readMaster()
+    void readRegister()
       .then((book) => {
         if (cancel) return;
         const saved = asRounds(book?.mowings);

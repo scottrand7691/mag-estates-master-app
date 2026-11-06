@@ -141,7 +141,14 @@ export const writeMaster = createServerFn({ method: "POST" })
           return { ok: true as const, count: merged.length };
         }
         await archiveBook(current);
-        await writeFile(file, `${JSON.stringify({ saved: data.saved, lots: merged, bills: data.bills ?? current.bills, mowings: data.mowings ?? current.mowings, board: data.board ?? current.board, store })}\n`);
+        const body = `${JSON.stringify({ saved: data.saved, lots: merged, bills: data.bills ?? current.bills, mowings: data.mowings ?? current.mowings, board: data.board ?? current.board, store })}\n`;
+        await writeFile(file, body);
+        try {
+          await mkdir(join(process.cwd(), "public"), { recursive: true });
+          await writeFile(join(process.cwd(), "public", "magnolia-register.json"), body);
+        } catch {
+          /* the office file is saved; the published copy updates on the next publish */
+        }
         return { ok: true as const, count: merged.length };
       }
       if (JSON.stringify(current.lots) === lotsBody) {
@@ -150,7 +157,14 @@ export const writeMaster = createServerFn({ method: "POST" })
     } catch {
       /* the file is created below */
     }
-    await writeFile(file, `${JSON.stringify({ saved: data.saved, lots: data.lots, bills: data.bills, mowings: data.mowings, board: data.board, store: data.store })}\n`);
+    const body = `${JSON.stringify({ saved: data.saved, lots: data.lots, bills: data.bills, mowings: data.mowings, board: data.board, store: data.store })}\n`;
+    await writeFile(file, body);
+    try {
+      await mkdir(join(process.cwd(), "public"), { recursive: true });
+      await writeFile(join(process.cwd(), "public", "magnolia-register.json"), body);
+    } catch {
+      /* the office file is saved; the published copy updates on the next publish */
+    }
     return { ok: true as const, count: data.lots.length };
   });
 
