@@ -77,7 +77,7 @@ function loadRemembered(): RememberedLogin | null {
   try {
     const raw = JSON.parse(localStorage.getItem(REMEMBER_KEY) ?? "null") as RememberedLogin | null;
     if (!raw || (raw.mode !== "landlord" && raw.mode !== "resident" && raw.mode !== "maintenance" && raw.mode !== "vendor" && raw.mode !== "manager")) return null;
-    return { mode: raw.mode, landlordName: raw.landlordName ?? "", address: raw.address ?? "", username: raw.username ?? "", password: raw.password ?? "" };
+    return { mode: raw.mode, landlordName: raw.landlordName ?? "", address: raw.address ?? "", username: raw.username ?? "", password: raw.password === "magnolia" ? "magnolia26" : (raw.password ?? "") };
   } catch {
     return null;
   }
@@ -97,9 +97,14 @@ function maintenancePassword() {
 
 function landlordPassword() {
   try {
-    return localStorage.getItem(LANDLORD_KEY) || "magnolia";
+    const saved = localStorage.getItem(LANDLORD_KEY);
+    if (!saved || saved === "magnolia") {
+      localStorage.setItem(LANDLORD_KEY, "magnolia26");
+      return "magnolia26";
+    }
+    return saved;
   } catch {
-    return "magnolia";
+    return "magnolia26";
   }
 }
 
