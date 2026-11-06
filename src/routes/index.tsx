@@ -288,10 +288,11 @@ function printTodo(items: { lot: string; address: string; street: string; name: 
 }
 
 const MAP_PRINT_CSS = `
-  html, body { margin: 0; background: #fff; color: #1c1916; }
-  h1 { margin: 0 0 8px; font: 700 16px sans-serif; letter-spacing: 0.08em; text-transform: uppercase; }
-  svg { width: 100% !important; height: auto !important; max-height: none !important; display: block; }
-  svg text { font-family: "Avenir Next", "Segoe UI", sans-serif; fill: #1c1916; }
+  :root { color-scheme: light; --color-ink: #1c1916; --color-paper: #ffffff; --color-bg: #ffffff; }
+  html, body { margin: 0; background: #fff !important; color: #1c1916 !important; color-scheme: light; }
+  h1 { margin: 0 0 8px; font: 700 16px sans-serif; letter-spacing: 0.08em; text-transform: uppercase; color: #1c1916; }
+  svg { width: 100% !important; height: auto !important; max-height: none !important; display: block; background: #fff !important; }
+  svg text, .street-label { font-family: "Avenir Next", "Segoe UI", sans-serif; fill: #1c1916 !important; }
   .lot rect, .lot polygon { fill: #f6f3ec; stroke: #000; stroke-width: 1.9; }
   .lot.occupied rect, .lot.occupied polygon { fill: rgb(40 175 80 / 14%); }
   .lot.empty rect, .lot.empty polygon { fill: #b5b5b5; }
@@ -301,7 +302,7 @@ const MAP_PRINT_CSS = `
   .lot.maint rect, .lot.maint polygon { fill: url(#maintStripes); }
   .lot.leak rect, .lot.leak polygon { fill: #2f7bff; }
   .lot.eviction rect, .lot.eviction polygon { fill: #e10600; }
-  .lot.eviction text { fill: #fff; }
+  .lot.eviction text, .lot.late text, .lot.leak text { fill: #fff !important; }
   .lot.roof rect, .lot.roof polygon { fill: #2f6bff; }
   .landmark rect { fill: transparent; stroke: #2a2622; stroke-width: 1.5; }
   .landmark.plant rect { fill: rgb(122 74 32 / 35%); }
@@ -348,13 +349,15 @@ function openMapPrint(title: string, body: string, page: "landscape" | "portrait
   win.document.open();
   win.document.write(html);
   win.document.close();
+  let printed = false;
   const go = () => {
-    if (win.closed) return;
+    if (printed || win.closed) return;
+    printed = true;
     win.focus();
     win.print();
   };
-  win.onload = () => setTimeout(go, 200);
-  setTimeout(go, 400);
+  if (win.document.readyState === "complete") setTimeout(go, 200);
+  else win.onload = () => setTimeout(go, 200);
 }
 
 function printMap(id: SheetId) {
